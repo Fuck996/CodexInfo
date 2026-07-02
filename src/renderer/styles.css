@@ -377,8 +377,11 @@ button {
 
 .token-total {
   justify-self: end;
+  max-width: 100%;
+  overflow: hidden;
   color: var(--text);
-  font-size: 18px;
+  font-size: 17px;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -397,15 +400,33 @@ button {
 }
 
 .token-metrics span {
+  display: grid;
+  gap: 3px;
   min-width: 0;
-  padding: 8px;
+  padding: 7px 6px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 6px;
   color: var(--muted);
   background: rgba(255, 255, 255, 0.055);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.token-metrics small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  text-overflow: ellipsis;
+}
+
+.token-metrics strong {
+  overflow: hidden;
+  color: var(--muted-strong);
   font-size: 11px;
-  text-align: center;
+  font-weight: 700;
+  line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

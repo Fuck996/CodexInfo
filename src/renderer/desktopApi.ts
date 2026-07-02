@@ -15,7 +15,8 @@ const tauriApi: DesktopApi = {
   setTrayUsageEnabled: (enabled: boolean) => invoke<AppSettings>("set_tray_usage_enabled", { enabled }),
   setDockEnabled: (enabled: boolean) => invoke<AppSettings>("set_dock_enabled", { enabled }),
   setTaskbarUsageEnabled: (enabled: boolean) => invoke<AppSettings>("set_taskbar_usage_enabled", { enabled }),
-  setExpanded: (expanded: boolean, resetCount?: number) => invoke<void>("set_expanded", { expanded, resetCount })
+  setExpanded: (expanded: boolean, extraHeight?: number) => invoke<void>("set_expanded", { expanded, extraHeight }),
+  setHoverRegion: (region: "main" | "dock", active: boolean) => invoke<void>("set_hover_region", { region, active })
 };
 
 const unavailableApi: DesktopApi = {
@@ -25,11 +26,11 @@ const unavailableApi: DesktopApi = {
   getCachedUsageSnapshot: async () => null,
   getSettings: async () => ({
     launchAtStartup: false,
-    mainVisible: true,
+    mainVisible: false,
     keepAlwaysOnTop: true,
     trayUsageEnabled: true,
     dockEnabled: true,
-    taskbarUsageEnabled: false
+    taskbarUsageEnabled: true
   }),
   setLaunchAtStartup: async () => {
     throw new Error("Tauri 桥接不可用");
@@ -43,7 +44,8 @@ const unavailableApi: DesktopApi = {
   setTaskbarUsageEnabled: async () => {
     throw new Error("Tauri 桥接不可用");
   },
-  setExpanded: async () => undefined
+  setExpanded: async () => undefined,
+  setHoverRegion: async () => undefined
 };
 
 export const desktopApi = window.__TAURI_INTERNALS__ ? tauriApi : unavailableApi;

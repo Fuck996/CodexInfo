@@ -42,8 +42,6 @@ use windows::{
 
 const COLLAPSED_WIDTH: f64 = 460.0;
 const COLLAPSED_HEIGHT: f64 = 430.0;
-const RESET_DETAIL_BASE_HEIGHT: f64 = 130.0;
-const RESET_DETAIL_ROW_HEIGHT: f64 = 42.0;
 const MAX_EXPANDED_HEIGHT: f64 = 920.0;
 const DOCK_WIDTH: f64 = 250.0;
 const DOCK_HEIGHT: f64 = 42.0;
@@ -60,6 +58,9 @@ struct AppState {
     tray_usage_enabled: Arc<AtomicBool>,
     dock_enabled: Arc<AtomicBool>,
     taskbar_usage_enabled: Arc<AtomicBool>,
+    main_hovered: Arc<AtomicBool>,
+    dock_hovered: Arc<AtomicBool>,
+    hover_component_visible: Arc<AtomicBool>,
     latest_tray_usage: Arc<Mutex<Option<TrayUsageText>>>,
 }
 
@@ -67,8 +68,6 @@ struct AppState {
 struct TrayUsageText {
     title: String,
     tooltip: String,
-    taskbar_title: String,
-    taskbar_progress: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -168,7 +167,7 @@ struct StoredSettings {
 impl Default for StoredSettings {
     fn default() -> Self {
         Self {
-            main_visible: true,
+            main_visible: false,
             keep_always_on_top: true,
             tray_usage_enabled: true,
             dock_enabled: true,
@@ -900,12 +899,9 @@ fn build_tray_usage_text(snapshot: &UsageSnapshot) -> Option<TrayUsageText> {
         reset_duration(&five_hour.reset_at),
         reset_days(&weekly.reset_at)
     );
-    let taskbar_title = format!("CodexInfo · 5小时 {five_hour_percent}% · 每周 {weekly_percent}%");
     Some(TrayUsageText {
         title,
         tooltip,
-        taskbar_title,
-        taskbar_progress: five_hour_percent.clamp(0, 100) as u64,
     })
 }
 
@@ -937,29 +933,13 @@ fn update_taskbar_display(app: &AppHandle, state: &AppState) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    let enabled = state.taskbar_usage_enabled.load(Ordering::Relaxed);
-    let _ = window.set_skip_taskbar(!enabled);
-    if !enabled {
-        let _ = window.set_title("Codex 用量组件");
-        let _ = window.set_progress_bar(ProgressBarState {
-            status: Some(ProgressBarStatus::None),
-            progress: None,
-        });
-        return;
-    }
-
-    let usage = state
-        .latest_tray_usage
-        .lock()
-        .ok()
-        .and_then(|usage| usage.clone());
-    if let Some(usage) = usage {
-        let _ = window.set_title(&usage.taskbar_title);
-        let _ = window.set_progress_bar(ProgressBarState {
-            status: Some(ProgressBarStatus::Normal),
-            progress: Some(usage.taskbar_progress),
-        });
-    }
+    let _ = state;
+    let _ = window.set_skip_taskbar(true);
+    let _ = window.set_title("Codex \u{7528}\u{91cf}\u{7ec4}\u{4ef6}");
+    let _ = window.set_progress_bar(ProgressBarState {
+        status: Some(ProgressBarStatus::None),
+        progress: None,
+    });
 }
 
 #[cfg(target_os = "windows")]
@@ -1070,6 +1050,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState) {
     let enabled = state.dock_enabled.load(Ordering::Relaxed);
     let _ = window.set_skip_taskbar(true);
     let _ = window.set_always_on_top(true);
+    let _ = window.set_shadow(false);
     let _ = window.set_size(tauri::LogicalSize::new(DOCK_WIDTH, DOCK_HEIGHT));
 
     if enabled {
@@ -1278,13 +1259,14 @@ fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
         .is_enabled()
         .map_err(|error| error.to_string())?;
     let stored = read_stored_settings(&app)?;
+    let dock_enabled = stored.dock_enabled || stored.taskbar_usage_enabled;
     Ok(AppSettings {
         launch_at_startup,
         main_visible: stored.main_visible,
         keep_always_on_top: stored.keep_always_on_top,
         tray_usage_enabled: stored.tray_usage_enabled,
-        dock_enabled: stored.dock_enabled,
-        taskbar_usage_enabled: stored.taskbar_usage_enabled,
+        dock_enabled,
+        taskbar_usage_enabled: dock_enabled,
     })
 }
 
@@ -1313,9 +1295,12 @@ fn set_tray_usage_enabled(app: AppHandle, enabled: bool) -> Result<AppSettings, 
 fn set_dock_enabled(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
     let mut stored = read_stored_settings(&app)?;
     stored.dock_enabled = enabled;
+    stored.taskbar_usage_enabled = false;
     write_stored_settings(&app, &stored)?;
     let state = app.state::<AppState>();
     state.dock_enabled.store(enabled, Ordering::Relaxed);
+    state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
+    update_taskbar_display(&app, &state);
     update_dock_window(&app, &state);
     get_settings(app)
 }
@@ -1323,34 +1308,138 @@ fn set_dock_enabled(app: AppHandle, enabled: bool) -> Result<AppSettings, String
 #[tauri::command]
 fn set_taskbar_usage_enabled(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
     let mut stored = read_stored_settings(&app)?;
-    stored.taskbar_usage_enabled = enabled;
+    stored.dock_enabled = enabled;
+    stored.taskbar_usage_enabled = false;
     write_stored_settings(&app, &stored)?;
     let state = app.state::<AppState>();
-    state.taskbar_usage_enabled.store(enabled, Ordering::Relaxed);
+    state.dock_enabled.store(enabled, Ordering::Relaxed);
+    state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
     update_taskbar_display(&app, &state);
+    update_dock_window(&app, &state);
     get_settings(app)
 }
 
 #[tauri::command]
-fn set_expanded(app: AppHandle, expanded: bool, reset_count: Option<u32>) -> Result<(), String> {
+fn set_expanded(app: AppHandle, expanded: bool, extra_height: Option<u32>) -> Result<(), String> {
     let Some(window) = app.get_webview_window("main") else {
         return Ok(());
     };
     let size = if expanded {
-        let row_count = reset_count.unwrap_or(0).min(12) as f64;
-        let height = (COLLAPSED_HEIGHT + RESET_DETAIL_BASE_HEIGHT + RESET_DETAIL_ROW_HEIGHT * row_count)
-            .min(MAX_EXPANDED_HEIGHT);
+        let height = (COLLAPSED_HEIGHT + extra_height.unwrap_or(0) as f64).min(MAX_EXPANDED_HEIGHT);
         tauri::LogicalSize::new(COLLAPSED_WIDTH, height)
     } else {
         tauri::LogicalSize::new(COLLAPSED_WIDTH, COLLAPSED_HEIGHT)
     };
-    window.set_size(size).map_err(|error| error.to_string())
+    window.set_size(size).map_err(|error| error.to_string())?;
+    let state = app.state::<AppState>();
+    if state.hover_component_visible.load(Ordering::Relaxed) {
+        position_hover_component(&app, &window);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_hover_region(app: AppHandle, region: String, active: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    match region.as_str() {
+        "main" => state.main_hovered.store(active, Ordering::Relaxed),
+        "dock" => state.dock_hovered.store(active, Ordering::Relaxed),
+        _ => return Err(format!("unknown hover region: {region}")),
+    }
+
+    if active {
+        if region == "dock" || state.hover_component_visible.load(Ordering::Relaxed) {
+            show_hover_component(&app, &state);
+        }
+    } else {
+        hide_hover_component_if_idle(app.clone(), state.inner().clone());
+    }
+
+    Ok(())
 }
 
 fn show_window<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.unminimize();
     let _ = window.show();
     let _ = window.set_focus();
+}
+
+fn hover_component_position(app: &AppHandle, window: &WebviewWindow) -> Option<tauri::PhysicalPosition<i32>> {
+    let monitor = app.primary_monitor().ok().flatten()?;
+    let work_area = monitor.work_area();
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let size = window.outer_size().ok()?;
+    let work_left = work_area.position.x;
+    let work_top = work_area.position.y;
+    let work_right = work_left + work_area.size.width as i32;
+    let work_bottom = work_top + work_area.size.height as i32;
+    let monitor_top = monitor_position.y;
+    let monitor_bottom = monitor_top + monitor_size.height as i32;
+    let edge_gap = (DOCK_EDGE_GAP * monitor.scale_factor()).round() as i32;
+    let bottom_taskbar = monitor_bottom - work_bottom > edge_gap;
+    let top_taskbar = work_top - monitor_top > edge_gap;
+
+    let fallback_x = work_right - size.width as i32 - edge_gap;
+    let dock_right = app
+        .get_webview_window("dock")
+        .and_then(|dock| {
+            let position = dock.outer_position().ok()?;
+            let size = dock.outer_size().ok()?;
+            Some(position.x + size.width as i32)
+        })
+        .unwrap_or(work_right - edge_gap);
+    let x = (dock_right - size.width as i32)
+        .max(work_left + edge_gap)
+        .min(fallback_x.max(work_left + edge_gap));
+    let y = if top_taskbar {
+        work_top + edge_gap
+    } else if bottom_taskbar {
+        work_bottom - size.height as i32
+    } else {
+        work_bottom - size.height as i32 - edge_gap
+    }
+    .max(work_top + edge_gap);
+
+    Some(tauri::PhysicalPosition::new(x, y))
+}
+
+fn position_hover_component(app: &AppHandle, window: &WebviewWindow) {
+    if let Some(position) = hover_component_position(app, window) {
+        let _ = window.set_position(position);
+    }
+}
+
+fn show_hover_component(app: &AppHandle, state: &AppState) {
+    if !state.dock_enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    state.hover_component_visible.store(true, Ordering::Relaxed);
+    let _ = window.unminimize();
+    let _ = window.set_skip_taskbar(true);
+    let _ = window.set_always_on_top(true);
+    position_hover_component(app, &window);
+    let _ = window.show();
+}
+
+fn hide_hover_component_if_idle(app: AppHandle, state: AppState) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(180));
+        let inside_component = state.main_hovered.load(Ordering::Relaxed);
+        let inside_dock = state.dock_hovered.load(Ordering::Relaxed);
+        let hover_owned = state.hover_component_visible.load(Ordering::Relaxed);
+        if inside_component || inside_dock || !hover_owned {
+            return;
+        }
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+        }
+        state.hover_component_visible.store(false, Ordering::Relaxed);
+    });
 }
 
 fn show_window_near_tray<R: Runtime>(window: &WebviewWindow<R>, position: tauri::PhysicalPosition<f64>) {
@@ -1372,6 +1461,7 @@ fn show_window_near_tray<R: Runtime>(window: &WebviewWindow<R>, position: tauri:
 
 fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
     let stored_settings = read_stored_settings(app).unwrap_or_default();
+    let dock_enabled = stored_settings.dock_enabled || stored_settings.taskbar_usage_enabled;
     state
         .tray_usage_enabled
         .store(stored_settings.tray_usage_enabled, Ordering::Relaxed);
@@ -1380,10 +1470,10 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
         .store(stored_settings.keep_always_on_top, Ordering::Relaxed);
     state
         .dock_enabled
-        .store(stored_settings.dock_enabled, Ordering::Relaxed);
+        .store(dock_enabled, Ordering::Relaxed);
     state
         .taskbar_usage_enabled
-        .store(stored_settings.taskbar_usage_enabled, Ordering::Relaxed);
+        .store(false, Ordering::Relaxed);
     let visible_item = CheckMenuItem::with_id(
         app,
         "visible",
@@ -1413,15 +1503,7 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
         "taskbar_usage",
         "显示任务栏入口",
         true,
-        stored_settings.taskbar_usage_enabled,
-        None::<&str>,
-    )?;
-    let dock_item = CheckMenuItem::with_id(
-        app,
-        "dock",
-        "任务栏悬浮条",
-        true,
-        stored_settings.dock_enabled,
+        dock_enabled,
         None::<&str>,
     )?;
     let startup_checked = app.autolaunch().is_enabled().unwrap_or(false);
@@ -1433,7 +1515,6 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
         &[
             &visible_item,
             &top_item,
-            &dock_item,
             &tray_usage_item,
             &taskbar_usage_item,
             &startup_item,
@@ -1494,14 +1575,6 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
                     let _ = window.set_always_on_top(next);
                 }
             }
-            "dock" => {
-                let next = !state.dock_enabled.load(Ordering::Relaxed);
-                state.dock_enabled.store(next, Ordering::Relaxed);
-                let mut stored = read_stored_settings(app).unwrap_or_default();
-                stored.dock_enabled = next;
-                let _ = write_stored_settings(app, &stored);
-                update_dock_window(app, &state);
-            }
             "tray_usage" => {
                 let next = !state.tray_usage_enabled.load(Ordering::Relaxed);
                 state.tray_usage_enabled.store(next, Ordering::Relaxed);
@@ -1511,12 +1584,15 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
                 update_tray_display(app, &state);
             }
             "taskbar_usage" => {
-                let next = !state.taskbar_usage_enabled.load(Ordering::Relaxed);
-                state.taskbar_usage_enabled.store(next, Ordering::Relaxed);
+                let next = !state.dock_enabled.load(Ordering::Relaxed);
+                state.dock_enabled.store(next, Ordering::Relaxed);
+                state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
                 let mut stored = read_stored_settings(app).unwrap_or_default();
-                stored.taskbar_usage_enabled = next;
+                stored.dock_enabled = next;
+                stored.taskbar_usage_enabled = false;
                 let _ = write_stored_settings(app, &stored);
                 update_taskbar_display(app, &state);
+                update_dock_window(app, &state);
             }
             "startup" => {
                 let enabled = app.autolaunch().is_enabled().unwrap_or(false);
@@ -1544,6 +1620,9 @@ pub fn run() {
         tray_usage_enabled: Arc::new(AtomicBool::new(true)),
         dock_enabled: Arc::new(AtomicBool::new(true)),
         taskbar_usage_enabled: Arc::new(AtomicBool::new(false)),
+        main_hovered: Arc::new(AtomicBool::new(false)),
+        dock_hovered: Arc::new(AtomicBool::new(false)),
+        hover_component_visible: Arc::new(AtomicBool::new(false)),
         latest_tray_usage: Arc::new(Mutex::new(None)),
     };
 
@@ -1562,16 +1641,18 @@ pub fn run() {
             set_tray_usage_enabled,
             set_dock_enabled,
             set_taskbar_usage_enabled,
-            set_expanded
+            set_expanded,
+            set_hover_region
         ])
         .setup(move |app| {
             create_tray(app.handle(), state.clone())?;
             let stored_settings = read_stored_settings(app.handle()).unwrap_or_default();
+            let dock_enabled = stored_settings.dock_enabled || stored_settings.taskbar_usage_enabled;
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(stored_settings.keep_always_on_top);
-                let _ = window.set_skip_taskbar(!state.taskbar_usage_enabled.load(Ordering::Relaxed));
+                let _ = window.set_skip_taskbar(true);
                 let _ = window.set_size(tauri::LogicalSize::new(COLLAPSED_WIDTH, COLLAPSED_HEIGHT));
-                if stored_settings.main_visible {
+                if stored_settings.main_visible && !dock_enabled {
                     let _ = window.show();
                     let _ = window.set_focus();
                 } else {

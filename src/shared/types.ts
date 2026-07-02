@@ -72,5 +72,6 @@ export type DesktopApi = {
   setTrayUsageEnabled: (enabled: boolean) => Promise<AppSettings>;
   setDockEnabled: (enabled: boolean) => Promise<AppSettings>;
   setTaskbarUsageEnabled: (enabled: boolean) => Promise<AppSettings>;
-  setExpanded: (expanded: boolean, resetCount?: number) => Promise<void>;
+  setExpanded: (expanded: boolean, extraHeight?: number) => Promise<void>;
+  setHoverRegion: (region: "main" | "dock", active: boolean) => Promise<void>;
 };

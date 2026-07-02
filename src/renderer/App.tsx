@@ -6,6 +6,9 @@ import { desktopApi } from "./desktopApi";
 import appIcon from "../../src-tauri/icons/32x32.png";
 
 const refreshIntervalMs = 60_000;
+const apiCostPanelExtraHeight = 180;
+const resetDetailBaseExtraHeight = 130;
+const resetDetailRowExtraHeight = 42;
 const numberFormatter = new Intl.NumberFormat("zh-CN");
 const moneyFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -54,25 +57,29 @@ function formatToken(value: number | null | undefined) {
     return "--";
   }
 
+  if (value >= 100_000_000) {
+    return `${trimFixed(value / 100_000_000, 2)}亿`;
+  }
   if (value >= 10000) {
-    return `${(value / 10000).toFixed(1)}万`;
+    return `${trimFixed(value / 10000, 1)}万`;
   }
 
   return numberFormatter.format(value);
 }
 
 function tokenText(value: number | null | undefined) {
-  if (value === null || value === undefined || !Number.isFinite(value)) {
-    return "--";
-  }
+  return formatToken(value);
+}
 
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(2)}M`;
-  }
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(1)}K`;
-  }
-  return numberFormatter.format(value);
+function trimFixed(value: number, fractionDigits: number) {
+  return value
+    .toFixed(fractionDigits)
+    .replace(/\.0+$/, "")
+    .replace(/(\.\d*?)0+$/, "$1");
+}
+
+function setHoverRegion(region: "main" | "dock", active: boolean) {
+  void desktopApi.setHoverRegion(region, active);
 }
 
 function apiEquivalentCostFromUsage(tokenUsage: TokenUsage) {
@@ -134,6 +141,10 @@ function formatFullDate(value: string) {
   }
 
   return fullDateFormatter.format(date);
+}
+
+function periodStartLabel(value: string | undefined) {
+  return value?.split(" · ")[0] ?? "";
 }
 
 function remainingTimeText(value: string) {
@@ -301,6 +312,13 @@ export function App() {
   const statusClass = codexConnected ? "is-connected" : loading ? "is-loading" : "is-offline";
   const statusTitle = codexConnected ? "Codex 已连接" : loading ? "正在连接 Codex" : "Codex 未连接";
 
+  function expandedExtraHeight(resetOpen: boolean, costOpen: boolean) {
+    const resetExtra = resetOpen && canExpand
+      ? resetDetailBaseExtraHeight + resetDetailRowExtraHeight * Math.min(sortedResets.length, 12)
+      : 0;
+    return resetExtra + (costOpen ? apiCostPanelExtraHeight : 0);
+  }
+
   if (currentWindowLabel === "dock") {
     return <DockBar loading={loading} snapshot={snapshot} windows={windows} />;
   }
@@ -312,17 +330,21 @@ export function App() {
 
     const next = !expanded;
     setExpanded(next);
-    await desktopApi.setExpanded(next || tokenExpanded, sortedResets.length + (tokenExpanded ? 4 : 0));
+    await desktopApi.setExpanded(next || tokenExpanded, expandedExtraHeight(next, tokenExpanded));
   }
 
   async function toggleTokenExpanded() {
     const next = !tokenExpanded;
     setTokenExpanded(next);
-    await desktopApi.setExpanded(expanded || next, sortedResets.length + (next ? 4 : 0));
+    await desktopApi.setExpanded(expanded || next, expandedExtraHeight(expanded, next));
   }
 
   return (
-    <main className={expanded ? "shell is-expanded" : "shell"}>
+    <main
+      className={expanded ? "shell is-expanded" : "shell"}
+      onMouseEnter={() => setHoverRegion("main", true)}
+      onMouseLeave={() => setHoverRegion("main", false)}
+    >
       <section className={canExpand ? "widget has-reset-details" : "widget"} aria-label="Codex 用量组件">
         <div className="chrome drag-region" data-tauri-drag-region>
           <div className="brand">
@@ -384,7 +406,11 @@ function DockBar({
   const fiveHour = windows.find((window) => window.id === "fiveHour");
   const sevenDay = windows.find((window) => window.id === "sevenDay");
   return (
-    <main className="dock-shell">
+    <main
+      className="dock-shell"
+      onMouseEnter={() => setHoverRegion("dock", true)}
+      onMouseLeave={() => setHoverRegion("dock", false)}
+    >
       <section className="dock-widget" aria-label="Codex 用量悬浮条">
         <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={appIcon} alt="" />
         <div className="dock-meters">
@@ -568,9 +594,20 @@ function TokenBlock({
           <div className="token-total">{formatToken(tokenUsed)}</div>
           {hasSplit && (
             <div className="token-metrics">
-              <span>输入 {formatToken(snapshot.tokenUsage.input)}</span>
-              <span>输出 {formatToken(snapshot.tokenUsage.output)}</span>
-              {snapshot.tokenUsage.limit !== null && <span>上限 {formatToken(snapshot.tokenUsage.limit)}</span>}
+              <span>
+                <small>输入</small>
+                <strong>{formatToken(snapshot.tokenUsage.input)}</strong>
+              </span>
+              <span>
+                <small>输出</small>
+                <strong>{formatToken(snapshot.tokenUsage.output)}</strong>
+              </span>
+              {snapshot.tokenUsage.limit !== null && (
+                <span>
+                  <small>上限</small>
+                  <strong>{formatToken(snapshot.tokenUsage.limit)}</strong>
+                </span>
+              )}
             </div>
           )}
         </button>
@@ -611,6 +648,7 @@ function ApiCostPanel({
   const range = periodUsage?.rangeLabel;
   const computedAt = periodUsage?.computedAt ?? snapshot.updatedAt;
   const sourceText = periodUsage ? "本地会话" : "当前快照";
+  const periodStart = periodStartLabel(range);
 
   return (
     <section className="api-cost-panel" aria-label="API 等价成本">
@@ -632,7 +670,7 @@ function ApiCostPanel({
         <div>
           <span>API 等价成本</span>
           <small>
-            计算于 {formatFullDate(computedAt)}{range ? ` · ${range}` : ""} · {sourceText}
+            计算于 {formatFullDate(computedAt)}{periodStart ? ` · ${periodStart}` : ""} · {sourceText}
           </small>
         </div>
         <strong>{moneyFormatter.format(cost.estimated)}</strong>
