@@ -1085,17 +1085,16 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
 
     if enabled {
         if let Some(position) = dock_position(app) {
-            if !dock_position_is_stable(state, position, force) {
-                return;
-            }
-            let target_x = position.x.round() as i32;
-            let target_y = position.y.round() as i32;
-            let should_move = window
-                .outer_position()
-                .map(|current| (current.x - target_x).abs() > 1 || (current.y - target_y).abs() > 1)
-                .unwrap_or(true);
-            if should_move {
-                move_dock_window(&window, position);
+            if dock_position_is_stable(state, position, force) {
+                let target_x = position.x.round() as i32;
+                let target_y = position.y.round() as i32;
+                let should_move = window
+                    .outer_position()
+                    .map(|current| (current.x - target_x).abs() > 1 || (current.y - target_y).abs() > 1)
+                    .unwrap_or(true);
+                if should_move {
+                    move_dock_window(&window, position);
+                }
             }
         }
         if !visible {
@@ -1407,6 +1406,15 @@ fn show_window<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.set_focus();
 }
 
+fn hide_main_component(app: &AppHandle, state: &AppState) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    state.hover_component_visible.store(false, Ordering::Relaxed);
+    state.main_hovered.store(false, Ordering::Relaxed);
+    update_dock_window(app, state, true);
+}
+
 fn hover_component_position(app: &AppHandle, window: &WebviewWindow) -> Option<tauri::PhysicalPosition<i32>> {
     let monitor = app.primary_monitor().ok().flatten()?;
     let work_area = monitor.work_area();
@@ -1515,10 +1523,7 @@ fn start_hover_monitor(app: AppHandle, state: AppState) {
             if cursor_inside_hover_area(&app) {
                 continue;
             }
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.hide();
-            }
-            state.hover_component_visible.store(false, Ordering::Relaxed);
+            hide_main_component(&app, &state);
             break;
         }
         state.hover_monitor_running.store(false, Ordering::Relaxed);
@@ -1532,10 +1537,7 @@ fn hide_hover_component_if_idle(app: AppHandle, state: AppState) {
         if cursor_inside_hover_area(&app) || !hover_owned {
             return;
         }
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.hide();
-        }
-        state.hover_component_visible.store(false, Ordering::Relaxed);
+        hide_main_component(&app, &state);
     });
 }
 
@@ -1613,8 +1615,7 @@ fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
             if let Some(window) = app.get_webview_window("main") {
                 if window.is_visible().unwrap_or(false) {
                     let _ = app.save_window_state(StateFlags::POSITION);
-                    let _ = window.hide();
-                    state.hover_component_visible.store(false, Ordering::Relaxed);
+                    hide_main_component(app, state);
                     let mut stored = read_stored_settings(app).unwrap_or_default();
                     stored.main_visible = false;
                     let _ = write_stored_settings(app, &stored);
@@ -1746,13 +1747,14 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
         ],
     )?;
     let icon = Image::from_bytes(include_bytes!("../icons/icon.png"))?;
+    let tray_state = state.clone();
 
     TrayIconBuilder::with_id("main-tray")
         .icon(icon)
         .tooltip("CodexInfo")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_tray_icon_event(|tray, event| {
+        .on_tray_icon_event(move |tray, event| {
             if let TrayIconEvent::Click {
                 position,
                 button: MouseButton::Left,
@@ -1760,11 +1762,13 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
                 ..
             } = event
             {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
                     if window.is_visible().unwrap_or(false) {
-                        let _ = window.hide();
+                        hide_main_component(app, &tray_state);
                     } else {
                         show_window_near_tray(&window, position);
+                        update_dock_window(app, &tray_state, true);
                     }
                 }
             }
@@ -1844,9 +1848,7 @@ pub fn run() {
                 match window.label() {
                     "main" => {
                         let _ = app.save_window_state(StateFlags::POSITION);
-                        let _ = window.hide();
-                        window_state.hover_component_visible.store(false, Ordering::Relaxed);
-                        window_state.main_hovered.store(false, Ordering::Relaxed);
+                        hide_main_component(app, &window_state);
                     }
                     "dock" => {
                         if window_state.dock_enabled.load(Ordering::Relaxed) {
