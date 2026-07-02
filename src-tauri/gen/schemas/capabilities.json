@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"CodexInfo desktop window permissions","local":true,"windows":["main","dock"],"permissions":["core:default","autostart:allow-enable","autostart:allow-disable","autostart:allow-is-enabled","window-state:default"]}}

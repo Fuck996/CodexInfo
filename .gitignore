@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-electron/
+src-tauri/target/
+release/
+*.log
+.env
+.env.*
+codex-usage.local.json
