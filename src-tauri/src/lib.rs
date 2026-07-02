@@ -34,8 +34,8 @@ use windows::{
     Win32::{
         Foundation::RECT,
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetWindowRect, SetWindowPos, HWND_TOPMOST,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+            FindWindowExW, FindWindowW, GetWindowLongPtrW, GetWindowRect, SetWindowPos, GWL_EXSTYLE,
+            HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
         },
     },
 };
@@ -1048,6 +1048,10 @@ fn pin_dock_window(_: &WebviewWindow, _: tauri::PhysicalPosition<f64>) {}
 fn keep_dock_window_topmost(window: &WebviewWindow) {
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            if ex_style & WS_EX_TOPMOST.0 != 0 {
+                return;
+            }
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -1055,7 +1059,7 @@ fn keep_dock_window_topmost(window: &WebviewWindow) {
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
     }
@@ -1917,7 +1921,10 @@ pub fn run() {
                     }
                     "dock" => {
                         if window_state.dock_enabled.load(Ordering::Relaxed) {
-                            update_dock_window(app, &window_state, true);
+                            if let Some(dock) = app.get_webview_window("dock") {
+                                let _ = dock.show();
+                                keep_dock_window_topmost(&dock);
+                            }
                         } else {
                             let _ = window.hide();
                         }
