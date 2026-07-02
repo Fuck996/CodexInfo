@@ -62,6 +62,7 @@ struct AppState {
     dock_hovered: Arc<AtomicBool>,
     hover_component_visible: Arc<AtomicBool>,
     hover_monitor_running: Arc<AtomicBool>,
+    dock_pending_position: Arc<Mutex<Option<(i32, i32)>>>,
     latest_tray_usage: Arc<Mutex<Option<TrayUsageText>>>,
 }
 
@@ -1043,7 +1044,38 @@ fn pin_dock_window(window: &WebviewWindow, position: tauri::PhysicalPosition<f64
 #[cfg(not(target_os = "windows"))]
 fn pin_dock_window(_: &WebviewWindow, _: tauri::PhysicalPosition<f64>) {}
 
-fn update_dock_window(app: &AppHandle, state: &AppState) {
+fn dock_position_is_stable(state: &AppState, position: tauri::PhysicalPosition<f64>, force: bool) -> bool {
+    if force {
+        if let Ok(mut pending) = state.dock_pending_position.lock() {
+            *pending = Some((position.x.round() as i32, position.y.round() as i32));
+        }
+        return true;
+    }
+
+    let target = (position.x.round() as i32, position.y.round() as i32);
+    let Ok(mut pending) = state.dock_pending_position.lock() else {
+        return true;
+    };
+    if pending.as_ref() == Some(&target) {
+        true
+    } else {
+        *pending = Some(target);
+        false
+    }
+}
+
+fn move_dock_window(window: &WebviewWindow, position: tauri::PhysicalPosition<f64>) {
+    #[cfg(target_os = "windows")]
+    {
+        pin_dock_window(window, position);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window.set_position(position);
+    }
+}
+
+fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
     let Some(window) = app.get_webview_window("dock") else {
         return;
     };
@@ -1053,6 +1085,9 @@ fn update_dock_window(app: &AppHandle, state: &AppState) {
 
     if enabled {
         if let Some(position) = dock_position(app) {
+            if !dock_position_is_stable(state, position, force) {
+                return;
+            }
             let target_x = position.x.round() as i32;
             let target_y = position.y.round() as i32;
             let should_move = window
@@ -1060,8 +1095,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState) {
                 .map(|current| (current.x - target_x).abs() > 1 || (current.y - target_y).abs() > 1)
                 .unwrap_or(true);
             if should_move {
-                let _ = window.set_position(position);
-                pin_dock_window(&window, position);
+                move_dock_window(&window, position);
             }
         }
         if !visible {
@@ -1082,7 +1116,6 @@ fn set_latest_tray_usage(app: &AppHandle, snapshot: &UsageSnapshot) {
     }
     update_tray_display(app, &state);
     update_taskbar_display(app, &state);
-    update_dock_window(app, &state);
 }
 
 fn fetch_reset_credits_from_chatgpt() -> Result<(Option<ResetCredits>, Vec<ResetChance>), String> {
@@ -1311,7 +1344,7 @@ fn set_dock_enabled(app: AppHandle, enabled: bool) -> Result<AppSettings, String
     state.dock_enabled.store(enabled, Ordering::Relaxed);
     state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
     update_taskbar_display(&app, &state);
-    update_dock_window(&app, &state);
+    update_dock_window(&app, &state, true);
     get_settings(app)
 }
 
@@ -1325,7 +1358,7 @@ fn set_taskbar_usage_enabled(app: AppHandle, enabled: bool) -> Result<AppSetting
     state.dock_enabled.store(enabled, Ordering::Relaxed);
     state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
     update_taskbar_display(&app, &state);
-    update_dock_window(&app, &state);
+    update_dock_window(&app, &state, true);
     get_settings(app)
 }
 
@@ -1623,7 +1656,7 @@ fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
             stored.taskbar_usage_enabled = false;
             let _ = write_stored_settings(app, &stored);
             update_taskbar_display(app, state);
-            update_dock_window(app, state);
+            update_dock_window(app, state, true);
         }
         "startup" => {
             let enabled = app.autolaunch().is_enabled().unwrap_or(false);
@@ -1752,6 +1785,7 @@ pub fn run() {
         dock_hovered: Arc::new(AtomicBool::new(false)),
         hover_component_visible: Arc::new(AtomicBool::new(false)),
         hover_monitor_running: Arc::new(AtomicBool::new(false)),
+        dock_pending_position: Arc::new(Mutex::new(None)),
         latest_tray_usage: Arc::new(Mutex::new(None)),
     };
     let menu_state = state.clone();
@@ -1793,12 +1827,12 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
-            update_dock_window(app.handle(), &state);
+            update_dock_window(app.handle(), &state, true);
             let dock_app = app.handle().clone();
             let dock_state = state.clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(2));
-                update_dock_window(&dock_app, &dock_state);
+                update_dock_window(&dock_app, &dock_state, false);
             });
             Ok(())
         })
