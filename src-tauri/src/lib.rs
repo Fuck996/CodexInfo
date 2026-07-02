@@ -34,8 +34,10 @@ use windows::{
     Win32::{
         Foundation::RECT,
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetWindowLongPtrW, GetWindowRect, SetWindowPos, GWL_EXSTYLE,
-            HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
+            FindWindowExW, FindWindowW, GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos,
+            ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
         },
     },
 };
@@ -1045,6 +1047,46 @@ fn pin_dock_window(window: &WebviewWindow, position: tauri::PhysicalPosition<f64
 fn pin_dock_window(_: &WebviewWindow, _: tauri::PhysicalPosition<f64>) {}
 
 #[cfg(target_os = "windows")]
+fn configure_dock_window_style(window: &WebviewWindow) {
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let next = (current | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0) & !WS_EX_APPWINDOW.0;
+            if next != current {
+                let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_dock_window_style(_: &WebviewWindow) {}
+
+#[cfg(target_os = "windows")]
+fn show_dock_window(window: &WebviewWindow) {
+    configure_dock_window_style(window);
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_dock_window(window: &WebviewWindow) {
+    let _ = window.show();
+}
+
+#[cfg(target_os = "windows")]
 fn keep_dock_window_topmost(window: &WebviewWindow) {
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
@@ -1140,6 +1182,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
     let visible = window.is_visible().unwrap_or(false);
 
     if enabled {
+        configure_dock_window_style(&window);
         let scale_factor = app
             .primary_monitor()
             .ok()
@@ -1169,7 +1212,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
         if !visible {
             let _ = window.set_skip_taskbar(true);
             let _ = window.set_shadow(false);
-            let _ = window.show();
+            show_dock_window(&window);
         }
         keep_dock_window_topmost(&window);
     } else if visible {
@@ -1922,7 +1965,7 @@ pub fn run() {
                     "dock" => {
                         if window_state.dock_enabled.load(Ordering::Relaxed) {
                             if let Some(dock) = app.get_webview_window("dock") {
-                                let _ = dock.show();
+                                show_dock_window(&dock);
                                 keep_dock_window_topmost(&dock);
                             }
                         } else {
