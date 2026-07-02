@@ -1789,6 +1789,7 @@ pub fn run() {
         latest_tray_usage: Arc::new(Mutex::new(None)),
     };
     let menu_state = state.clone();
+    let window_state = state.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::default().build())
@@ -1836,11 +1837,28 @@ pub fn run() {
             });
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.app_handle().save_window_state(StateFlags::POSITION);
-                let _ = window.hide();
+                let app = window.app_handle();
+                match window.label() {
+                    "main" => {
+                        let _ = app.save_window_state(StateFlags::POSITION);
+                        let _ = window.hide();
+                        window_state.hover_component_visible.store(false, Ordering::Relaxed);
+                        window_state.main_hovered.store(false, Ordering::Relaxed);
+                    }
+                    "dock" => {
+                        if window_state.dock_enabled.load(Ordering::Relaxed) {
+                            update_dock_window(app, &window_state, true);
+                        } else {
+                            let _ = window.hide();
+                        }
+                    }
+                    _ => {
+                        let _ = window.hide();
+                    }
+                }
             }
         })
         .run(tauri::generate_context!())

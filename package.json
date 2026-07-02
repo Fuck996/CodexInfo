@@ -1,6 +1,6 @@
 {
   "name": "codex-info",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Codex 用量桌面组件",
   "type": "module",
