@@ -61,6 +61,7 @@ struct AppState {
     main_hovered: Arc<AtomicBool>,
     dock_hovered: Arc<AtomicBool>,
     hover_component_visible: Arc<AtomicBool>,
+    hover_monitor_running: Arc<AtomicBool>,
     latest_tray_usage: Arc<Mutex<Option<TrayUsageText>>>,
 }
 
@@ -1048,19 +1049,28 @@ fn update_dock_window(app: &AppHandle, state: &AppState) {
     };
 
     let enabled = state.dock_enabled.load(Ordering::Relaxed);
-    let _ = window.set_skip_taskbar(true);
-    let _ = window.set_always_on_top(true);
-    let _ = window.set_shadow(false);
-    let _ = window.set_size(tauri::LogicalSize::new(DOCK_WIDTH, DOCK_HEIGHT));
+    let visible = window.is_visible().unwrap_or(false);
 
     if enabled {
         if let Some(position) = dock_position(app) {
-            let _ = window.set_position(position);
-            pin_dock_window(&window, position);
+            let target_x = position.x.round() as i32;
+            let target_y = position.y.round() as i32;
+            let should_move = window
+                .outer_position()
+                .map(|current| (current.x - target_x).abs() > 1 || (current.y - target_y).abs() > 1)
+                .unwrap_or(true);
+            if should_move {
+                let _ = window.set_position(position);
+                pin_dock_window(&window, position);
+            }
         }
-        let _ = window.show();
-        let _ = window.set_always_on_top(true);
-    } else {
+        if !visible {
+            let _ = window.set_skip_taskbar(true);
+            let _ = window.set_shadow(false);
+            let _ = window.show();
+            let _ = window.set_always_on_top(true);
+        }
+    } else if visible {
         let _ = window.hide();
     }
 }
@@ -1419,20 +1429,74 @@ fn show_hover_component(app: &AppHandle, state: &AppState) {
     };
 
     state.hover_component_visible.store(true, Ordering::Relaxed);
-    let _ = window.unminimize();
-    let _ = window.set_skip_taskbar(true);
-    let _ = window.set_always_on_top(true);
+    let visible = window.is_visible().unwrap_or(false);
     position_hover_component(app, &window);
-    let _ = window.show();
+    if !visible {
+        let _ = window.unminimize();
+        let _ = window.set_skip_taskbar(true);
+        let _ = window.set_always_on_top(true);
+        let _ = window.show();
+    }
+    start_hover_monitor(app.clone(), state.clone());
+}
+
+fn cursor_inside_window(app: &AppHandle, label: &str) -> bool {
+    let Some(window) = app.get_webview_window(label) else {
+        return false;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return false;
+    }
+    let Ok(cursor) = app.cursor_position() else {
+        return false;
+    };
+    let Ok(position) = window.outer_position() else {
+        return false;
+    };
+    let Ok(size) = window.outer_size() else {
+        return false;
+    };
+
+    let left = position.x as f64;
+    let top = position.y as f64;
+    let right = left + size.width as f64;
+    let bottom = top + size.height as f64;
+    cursor.x >= left && cursor.x <= right && cursor.y >= top && cursor.y <= bottom
+}
+
+fn cursor_inside_hover_area(app: &AppHandle) -> bool {
+    cursor_inside_window(app, "main") || cursor_inside_window(app, "dock")
+}
+
+fn start_hover_monitor(app: AppHandle, state: AppState) {
+    if state.hover_monitor_running.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(120));
+            if !state.hover_component_visible.load(Ordering::Relaxed) {
+                break;
+            }
+            if cursor_inside_hover_area(&app) {
+                continue;
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+            state.hover_component_visible.store(false, Ordering::Relaxed);
+            break;
+        }
+        state.hover_monitor_running.store(false, Ordering::Relaxed);
+    });
 }
 
 fn hide_hover_component_if_idle(app: AppHandle, state: AppState) {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(180));
-        let inside_component = state.main_hovered.load(Ordering::Relaxed);
-        let inside_dock = state.dock_hovered.load(Ordering::Relaxed);
         let hover_owned = state.hover_component_visible.load(Ordering::Relaxed);
-        if inside_component || inside_dock || !hover_owned {
+        if cursor_inside_hover_area(&app) || !hover_owned {
             return;
         }
         if let Some(window) = app.get_webview_window("main") {
@@ -1457,6 +1521,133 @@ fn show_window_near_tray<R: Runtime>(window: &WebviewWindow<R>, position: tauri:
     let y = (position.y - height - 12.0 * scale_factor).max(0.0);
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
     show_window(window);
+}
+
+fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let stored_settings = read_stored_settings(app).unwrap_or_default();
+    let dock_enabled = stored_settings.dock_enabled || stored_settings.taskbar_usage_enabled;
+    let visible_item = CheckMenuItem::with_id(
+        app,
+        "visible",
+        "显示组件",
+        true,
+        stored_settings.main_visible,
+        None::<&str>,
+    )?;
+    let top_item = CheckMenuItem::with_id(
+        app,
+        "top",
+        "保持置顶",
+        true,
+        stored_settings.keep_always_on_top,
+        None::<&str>,
+    )?;
+    let tray_usage_item = CheckMenuItem::with_id(
+        app,
+        "tray_usage",
+        "托盘显示用量",
+        true,
+        stored_settings.tray_usage_enabled,
+        None::<&str>,
+    )?;
+    let taskbar_usage_item = CheckMenuItem::with_id(
+        app,
+        "taskbar_usage",
+        "显示任务栏入口",
+        true,
+        dock_enabled,
+        None::<&str>,
+    )?;
+    let startup_checked = app.autolaunch().is_enabled().unwrap_or(false);
+    let startup_item = CheckMenuItem::with_id(app, "startup", "开机启动", true, startup_checked, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    Menu::with_items(
+        app,
+        &[
+            &visible_item,
+            &top_item,
+            &tray_usage_item,
+            &taskbar_usage_item,
+            &startup_item,
+            &quit_item,
+        ],
+    )
+}
+
+fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
+    match id {
+        "visible" => {
+            if let Some(window) = app.get_webview_window("main") {
+                if window.is_visible().unwrap_or(false) {
+                    let _ = app.save_window_state(StateFlags::POSITION);
+                    let _ = window.hide();
+                    state.hover_component_visible.store(false, Ordering::Relaxed);
+                    let mut stored = read_stored_settings(app).unwrap_or_default();
+                    stored.main_visible = false;
+                    let _ = write_stored_settings(app, &stored);
+                } else {
+                    show_window(&window);
+                    let mut stored = read_stored_settings(app).unwrap_or_default();
+                    stored.main_visible = true;
+                    let _ = write_stored_settings(app, &stored);
+                }
+            }
+        }
+        "top" => {
+            let next = !state.keep_always_on_top.load(Ordering::Relaxed);
+            state.keep_always_on_top.store(next, Ordering::Relaxed);
+            let mut stored = read_stored_settings(app).unwrap_or_default();
+            stored.keep_always_on_top = next;
+            let _ = write_stored_settings(app, &stored);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_always_on_top(next);
+            }
+            if let Some(window) = app.get_webview_window("dock") {
+                let _ = window.set_always_on_top(next);
+            }
+        }
+        "tray_usage" => {
+            let next = !state.tray_usage_enabled.load(Ordering::Relaxed);
+            state.tray_usage_enabled.store(next, Ordering::Relaxed);
+            let mut stored = read_stored_settings(app).unwrap_or_default();
+            stored.tray_usage_enabled = next;
+            let _ = write_stored_settings(app, &stored);
+            update_tray_display(app, state);
+        }
+        "taskbar_usage" => {
+            let next = !state.dock_enabled.load(Ordering::Relaxed);
+            state.dock_enabled.store(next, Ordering::Relaxed);
+            state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
+            let mut stored = read_stored_settings(app).unwrap_or_default();
+            stored.dock_enabled = next;
+            stored.taskbar_usage_enabled = false;
+            let _ = write_stored_settings(app, &stored);
+            update_taskbar_display(app, state);
+            update_dock_window(app, state);
+        }
+        "startup" => {
+            let enabled = app.autolaunch().is_enabled().unwrap_or(false);
+            if enabled {
+                let _ = app.autolaunch().disable();
+            } else {
+                let _ = app.autolaunch().enable();
+            }
+        }
+        "quit" => {
+            let _ = app.save_window_state(StateFlags::POSITION);
+            app.exit(0);
+        }
+        _ => {}
+    }
+}
+
+#[tauri::command]
+fn show_dock_menu(app: AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("dock") else {
+        return Ok(());
+    };
+    let menu = build_app_menu(&app).map_err(|error| error.to_string())?;
+    window.popup_menu(&menu).map_err(|error| error.to_string())
 }
 
 fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
@@ -1545,69 +1736,6 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
                 }
             }
         })
-        .on_menu_event(move |app, event| match event.id.as_ref() {
-            "visible" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    if window.is_visible().unwrap_or(false) {
-                        let _ = app.save_window_state(StateFlags::POSITION);
-                        let _ = window.hide();
-                        let mut stored = read_stored_settings(app).unwrap_or_default();
-                        stored.main_visible = false;
-                        let _ = write_stored_settings(app, &stored);
-                    } else {
-                        show_window(&window);
-                        let mut stored = read_stored_settings(app).unwrap_or_default();
-                        stored.main_visible = true;
-                        let _ = write_stored_settings(app, &stored);
-                    }
-                }
-            }
-            "top" => {
-                let next = !state.keep_always_on_top.load(Ordering::Relaxed);
-                state.keep_always_on_top.store(next, Ordering::Relaxed);
-                let mut stored = read_stored_settings(app).unwrap_or_default();
-                stored.keep_always_on_top = next;
-                let _ = write_stored_settings(app, &stored);
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_always_on_top(next);
-                }
-                if let Some(window) = app.get_webview_window("dock") {
-                    let _ = window.set_always_on_top(next);
-                }
-            }
-            "tray_usage" => {
-                let next = !state.tray_usage_enabled.load(Ordering::Relaxed);
-                state.tray_usage_enabled.store(next, Ordering::Relaxed);
-                let mut stored = read_stored_settings(app).unwrap_or_default();
-                stored.tray_usage_enabled = next;
-                let _ = write_stored_settings(app, &stored);
-                update_tray_display(app, &state);
-            }
-            "taskbar_usage" => {
-                let next = !state.dock_enabled.load(Ordering::Relaxed);
-                state.dock_enabled.store(next, Ordering::Relaxed);
-                state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
-                let mut stored = read_stored_settings(app).unwrap_or_default();
-                stored.dock_enabled = next;
-                stored.taskbar_usage_enabled = false;
-                let _ = write_stored_settings(app, &stored);
-                update_taskbar_display(app, &state);
-                update_dock_window(app, &state);
-            }
-            "startup" => {
-                let enabled = app.autolaunch().is_enabled().unwrap_or(false);
-                if enabled {
-                    let _ = app.autolaunch().disable();
-                } else {
-                    let _ = app.autolaunch().enable();
-                }
-            }
-            "quit" => {
-                let _ = app.save_window_state(StateFlags::POSITION);
-                app.exit(0);
-            }
-            _ => {}
-        })
         .build(app)?;
 
     Ok(())
@@ -1623,8 +1751,10 @@ pub fn run() {
         main_hovered: Arc::new(AtomicBool::new(false)),
         dock_hovered: Arc::new(AtomicBool::new(false)),
         hover_component_visible: Arc::new(AtomicBool::new(false)),
+        hover_monitor_running: Arc::new(AtomicBool::new(false)),
         latest_tray_usage: Arc::new(Mutex::new(None)),
     };
+    let menu_state = state.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::default().build())
@@ -1642,8 +1772,12 @@ pub fn run() {
             set_dock_enabled,
             set_taskbar_usage_enabled,
             set_expanded,
-            set_hover_region
+            set_hover_region,
+            show_dock_menu
         ])
+        .on_menu_event(move |app, event| {
+            handle_menu_event(app, &menu_state, event.id.as_ref());
+        })
         .setup(move |app| {
             create_tray(app.handle(), state.clone())?;
             let stored_settings = read_stored_settings(app.handle()).unwrap_or_default();

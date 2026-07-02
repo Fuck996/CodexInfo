@@ -107,7 +107,8 @@ button {
   overflow: hidden;
   color: var(--text);
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.78);
-  -webkit-app-region: drag;
+  -webkit-app-region: no-drag;
+  user-select: none;
 }
 
 .dock-meters {

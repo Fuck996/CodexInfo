@@ -410,6 +410,14 @@ function DockBar({
       className="dock-shell"
       onMouseEnter={() => setHoverRegion("dock", true)}
       onMouseLeave={() => setHoverRegion("dock", false)}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        void desktopApi.showDockMenu();
+      }}
+      onDoubleClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
     >
       <section className="dock-widget" aria-label="Codex 用量悬浮条">
         <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={appIcon} alt="" />
