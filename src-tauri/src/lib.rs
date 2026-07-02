@@ -35,7 +35,7 @@ use windows::{
         Foundation::RECT,
         UI::WindowsAndMessaging::{
             FindWindowExW, FindWindowW, GetWindowRect, SetWindowPos, HWND_TOPMOST,
-            SWP_NOACTIVATE, SWP_NOSIZE,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
         },
     },
 };
@@ -1044,6 +1044,28 @@ fn pin_dock_window(window: &WebviewWindow, position: tauri::PhysicalPosition<f64
 #[cfg(not(target_os = "windows"))]
 fn pin_dock_window(_: &WebviewWindow, _: tauri::PhysicalPosition<f64>) {}
 
+#[cfg(target_os = "windows")]
+fn keep_dock_window_topmost(window: &WebviewWindow) {
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn keep_dock_window_topmost(window: &WebviewWindow) {
+    let _ = window.set_always_on_top(true);
+}
+
 fn dock_position_is_stable(state: &AppState, position: tauri::PhysicalPosition<f64>, force: bool) -> bool {
     if force {
         if let Ok(mut pending) = state.dock_pending_position.lock() {
@@ -1101,8 +1123,8 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
             let _ = window.set_skip_taskbar(true);
             let _ = window.set_shadow(false);
             let _ = window.show();
-            let _ = window.set_always_on_top(true);
         }
+        keep_dock_window_topmost(&window);
     } else if visible {
         let _ = window.hide();
     }
@@ -1836,7 +1858,7 @@ pub fn run() {
             let dock_app = app.handle().clone();
             let dock_state = state.clone();
             thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(2));
+                thread::sleep(Duration::from_millis(750));
                 update_dock_window(&dock_app, &dock_state, false);
             });
             Ok(())
