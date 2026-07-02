@@ -1013,13 +1013,16 @@ fn dock_position(app: &AppHandle) -> Option<tauri::PhysicalPosition<f64>> {
     .min(right - width - edge_gap);
 
     let y = if bottom_taskbar {
-        work_bottom - height - edge_gap
+        let taskbar_height = bottom - work_bottom;
+        work_bottom + ((taskbar_height - height) / 2.0).max(0.0)
     } else if top_taskbar {
-        work_top + edge_gap
+        let taskbar_height = work_top - top;
+        top + ((taskbar_height - height) / 2.0).max(0.0)
     } else {
         bottom - height - edge_gap
     }
-    .max(top + edge_gap);
+    .max(top + edge_gap)
+    .min(bottom - height - edge_gap);
 
     Some(tauri::PhysicalPosition::new(x, y))
 }
