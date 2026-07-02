@@ -16,7 +16,7 @@
   --green: #5bea65;
   --yellow: #ffd21a;
   --blue: #4e91ff;
-  font-family: "Zpix", "Fusion Pixel 12px Proportional zh_hans", "DotGothic16", "Courier New", monospace;
+  font-family: "Fusion Pixel 12px Proportional SC", "Zpix", "Courier New", monospace;
   font-synthesis: none;
   text-rendering: geometricPrecision;
   -webkit-font-smoothing: none;
@@ -177,6 +177,7 @@ button {
 .quota-grid,
 .token-section,
 .token-block,
+.api-summary-card,
 .subscription-strip,
 .reset-overview,
 .reset-detail-panel,
@@ -253,6 +254,7 @@ button {
 
 .usage-card,
 .token-block,
+.api-summary-card,
 .subscription-strip {
   border: 1px solid rgba(255, 255, 255, 0.11);
   border-radius: 8px;
@@ -339,13 +341,19 @@ button {
   margin: 0 16px;
 }
 
+.token-summary-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
 .token-block {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
   gap: 9px 12px;
   padding: 12px;
-  width: 236px;
-  max-width: 100%;
+  width: 100%;
+  min-width: 0;
   color: inherit;
   text-align: left;
   cursor: pointer;
@@ -354,7 +362,10 @@ button {
 
 .token-block:hover,
 .token-block:focus-visible,
-.token-block.is-expanded {
+.token-block.is-expanded,
+.api-summary-card:hover,
+.api-summary-card:focus-visible,
+.api-summary-card.is-expanded {
   border-color: rgba(255, 101, 0, 0.42);
   outline: none;
 }
@@ -399,6 +410,41 @@ button {
   white-space: nowrap;
 }
 
+.api-summary-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.api-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.api-summary-card strong {
+  overflow: hidden;
+  color: var(--accent);
+  font-size: 21px;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-shadow: 0 0 16px rgba(255, 101, 0, 0.38);
+}
+
+.api-summary-card small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .api-cost-panel {
   display: grid;
   gap: 10px;
@@ -441,11 +487,30 @@ button {
 
 .api-cost-head {
   display: flex;
-  align-items: baseline;
+  align-items: start;
   justify-content: space-between;
   gap: 12px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.api-cost-head > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.api-cost-head span {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.api-cost-head small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .api-cost-head strong {

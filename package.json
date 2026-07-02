@@ -13,7 +13,7 @@
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
-    "@fontsource/dotgothic16": "^5.2.8",
+    "@fontsource/fusion-pixel-12px-proportional-sc": "^5.2.5",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-autostart": "^2.5.1",
     "@tauri-apps/plugin-window-state": "^2.4.1",

@@ -1,7 +1,7 @@
-import { ChevronDown, ChevronUp, Database } from "lucide-react";
+﻿import { ChevronDown, ChevronUp, Database } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { UsageSnapshot, UsageWindow } from "../shared/types";
+import type { TokenPeriodId, TokenPeriodUsage, TokenUsage, UsageSnapshot, UsageWindow } from "../shared/types";
 import { desktopApi } from "./desktopApi";
 import appIcon from "../../src-tauri/icons/32x32.png";
 
@@ -13,13 +13,13 @@ const moneyFormatter = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 4,
   maximumFractionDigits: 4
 });
-type ApiCostPeriod = "current" | "previous" | "month" | "custom";
+type ApiCostPeriod = TokenPeriodId;
 
 const apiCostPeriods: Array<{ id: ApiCostPeriod; label: string }> = [
-  { id: "current", label: "本周期" },
-  { id: "previous", label: "上个周期" },
-  { id: "month", label: "本月" },
-  { id: "custom", label: "自定义" }
+  { id: "thisWeek", label: "本周" },
+  { id: "lastWeek", label: "上周" },
+  { id: "thisMonth", label: "本月" },
+  { id: "lastMonth", label: "上月" }
 ];
 const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
@@ -75,15 +75,19 @@ function tokenText(value: number | null | undefined) {
   return numberFormatter.format(value);
 }
 
-function apiEquivalentCost(snapshot: UsageSnapshot) {
-  const input = snapshot.tokenUsage.input ?? 0;
-  const cached = Math.min(input, Math.max(0, snapshot.tokenUsage.cachedInput ?? 0));
-  const output = snapshot.tokenUsage.output ?? 0;
+function apiEquivalentCostFromUsage(tokenUsage: TokenUsage) {
+  const input = tokenUsage.input ?? 0;
+  const cached = Math.min(input, Math.max(0, tokenUsage.cachedInput ?? 0));
+  const output = tokenUsage.output ?? 0;
   const uncached = Math.max(0, input - cached);
-  const total = snapshot.tokenUsage.total ?? uncached + cached + output;
+  const total = tokenUsage.total ?? uncached + cached + output;
   const estimated = (uncached / 1_000_000) * 5 + (cached / 1_000_000) * 0.5 + (output / 1_000_000) * 30;
 
   return { cached, estimated, output, total, uncached };
+}
+
+function apiEquivalentCost(snapshot: UsageSnapshot) {
+  return apiEquivalentCostFromUsage(snapshot.tokenUsage);
 }
 
 function formatDate(value: string) {
@@ -545,42 +549,68 @@ function TokenBlock({
   snapshot: UsageSnapshot;
   tokenUsed: number | null;
 }) {
-  const [period, setPeriod] = useState<ApiCostPeriod>("current");
+  const [period, setPeriod] = useState<ApiCostPeriod>("thisWeek");
   const hasSplit = snapshot.tokenUsage.input !== null || snapshot.tokenUsage.output !== null;
-  const cost = apiEquivalentCost(snapshot);
+  const tokenPeriods = snapshot.tokenPeriods ?? [];
+  const selectedPeriod = tokenPeriods.find((item) => item.id === period) ?? tokenPeriods[0];
+  const currentCost = selectedPeriod
+    ? apiEquivalentCostFromUsage(selectedPeriod.tokenUsage)
+    : apiEquivalentCost(snapshot);
 
   return (
     <div className="token-section">
-      <button className={expanded ? "token-block is-expanded" : "token-block"} type="button" onClick={onToggle}>
-      <div className="token-title">
-        <Database size={16} />
-        <span>Token</span>
+      <div className="token-summary-grid">
+        <button className={expanded ? "token-block is-expanded" : "token-block"} type="button" onClick={onToggle}>
+          <div className="token-title">
+            <Database size={16} />
+            <span>Token</span>
+          </div>
+          <div className="token-total">{formatToken(tokenUsed)}</div>
+          {hasSplit && (
+            <div className="token-metrics">
+              <span>输入 {formatToken(snapshot.tokenUsage.input)}</span>
+              <span>输出 {formatToken(snapshot.tokenUsage.output)}</span>
+              {snapshot.tokenUsage.limit !== null && <span>上限 {formatToken(snapshot.tokenUsage.limit)}</span>}
+            </div>
+          )}
+        </button>
+        <button className={expanded ? "api-summary-card is-expanded" : "api-summary-card"} type="button" onClick={onToggle}>
+          <div className="api-summary-head">
+            <span>API 等价成本</span>
+            <span className="token-chevron">{expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</span>
+          </div>
+          <strong>{moneyFormatter.format(currentCost.estimated)}</strong>
+          <small>{selectedPeriod?.label ?? "本周"}</small>
+        </button>
       </div>
-      <div className="token-total">{formatToken(tokenUsed)}</div>
-      <span className="token-chevron">{expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</span>
-      {hasSplit && (
-        <div className="token-metrics">
-          <span>输入 {formatToken(snapshot.tokenUsage.input)}</span>
-          <span>输出 {formatToken(snapshot.tokenUsage.output)}</span>
-          {snapshot.tokenUsage.limit !== null && <span>上限 {formatToken(snapshot.tokenUsage.limit)}</span>}
-        </div>
+      {expanded && (
+        <ApiCostPanel
+          cost={currentCost}
+          period={period}
+          periodUsage={selectedPeriod}
+          snapshot={snapshot}
+          onPeriodChange={setPeriod}
+        />
       )}
-      </button>
-      {expanded && <ApiCostPanel cost={cost} period={period} onPeriodChange={setPeriod} />}
     </div>
   );
 }
-
 function ApiCostPanel({
   cost,
   period,
+  periodUsage,
+  snapshot,
   onPeriodChange
 }: {
-  cost: ReturnType<typeof apiEquivalentCost>;
+  cost: ReturnType<typeof apiEquivalentCostFromUsage>;
   period: ApiCostPeriod;
+  periodUsage: TokenPeriodUsage | undefined;
+  snapshot: UsageSnapshot;
   onPeriodChange: (period: ApiCostPeriod) => void;
 }) {
-  const hasData = period === "current";
+  const range = periodUsage?.rangeLabel;
+  const computedAt = periodUsage?.computedAt ?? snapshot.updatedAt;
+  const sourceText = periodUsage ? "本地会话" : "当前快照";
 
   return (
     <section className="api-cost-panel" aria-label="API 等价成本">
@@ -599,31 +629,35 @@ function ApiCostPanel({
         ))}
       </div>
       <div className="api-cost-head">
-        <span>API 等价成本</span>
-        <strong>{hasData ? moneyFormatter.format(cost.estimated) : "--"}</strong>
+        <div>
+          <span>API 等价成本</span>
+          <small>
+            计算于 {formatFullDate(computedAt)}{range ? ` · ${range}` : ""} · {sourceText}
+          </small>
+        </div>
+        <strong>{moneyFormatter.format(cost.estimated)}</strong>
       </div>
       <div className="api-cost-grid">
         <span>
           <small>Tokens</small>
-          <strong>{hasData ? tokenText(cost.total) : "--"}</strong>
+          <strong>{tokenText(cost.total)}</strong>
         </span>
         <span>
           <small>非缓存输入</small>
-          <strong>{hasData ? tokenText(cost.uncached) : "--"}</strong>
+          <strong>{tokenText(cost.uncached)}</strong>
         </span>
         <span>
           <small>缓存输入</small>
-          <strong>{hasData ? tokenText(cost.cached) : "--"}</strong>
+          <strong>{tokenText(cost.cached)}</strong>
         </span>
         <span>
           <small>输出 tokens</small>
-          <strong>{hasData ? tokenText(cost.output) : "--"}</strong>
+          <strong>{tokenText(cost.output)}</strong>
         </span>
       </div>
     </section>
   );
 }
-
 function UsageCard({ window }: { window: UsageWindow }) {
   const remaining = remainingOf(window);
   const remainingPercent = ratio(remaining, window.total);

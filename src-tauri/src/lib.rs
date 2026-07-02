@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
 use reqwest::{blocking::Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -83,7 +83,7 @@ struct UsageWindow {
     display_mode: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct TokenUsage {
     input: Option<f64>,
@@ -95,6 +95,17 @@ struct TokenUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<f64>,
     limit: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TokenPeriodUsage {
+    id: String,
+    label: String,
+    range_label: String,
+    token_usage: TokenUsage,
+    computed_at: String,
+    has_data: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -128,6 +139,8 @@ struct UsageSnapshot {
     account_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     cached_at: Option<String>,
+    #[serde(default)]
+    token_periods: Vec<TokenPeriodUsage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,7 +184,7 @@ struct DiscoveredSnapshot {
     account_source: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TokenCountEvent {
     timestamp: String,
     payload: Value,
@@ -302,6 +315,111 @@ fn token_usage_from_session(event: Option<&TokenCountEvent>) -> Option<TokenUsag
     })
 }
 
+fn empty_token_usage() -> TokenUsage {
+    TokenUsage {
+        input: Some(0.0),
+        cached_input: Some(0.0),
+        output: Some(0.0),
+        reasoning_output: Some(0.0),
+        total: Some(0.0),
+        limit: None,
+    }
+}
+
+fn merge_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
+    total.input = Some(total.input.unwrap_or(0.0) + usage.input.unwrap_or(0.0));
+    total.cached_input = Some(total.cached_input.unwrap_or(0.0) + usage.cached_input.unwrap_or(0.0));
+    total.output = Some(total.output.unwrap_or(0.0) + usage.output.unwrap_or(0.0));
+    total.reasoning_output = Some(total.reasoning_output.unwrap_or(0.0) + usage.reasoning_output.unwrap_or(0.0));
+    total.total = Some(total.total.unwrap_or(0.0) + usage.total.unwrap_or(0.0));
+}
+
+fn token_event_time(event: &TokenCountEvent) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&event.timestamp)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn local_midnight_utc(date: NaiveDate) -> Option<DateTime<Utc>> {
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    Local
+        .from_local_datetime(&midnight)
+        .earliest()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn add_months(year: i32, month: u32, offset: i32) -> Option<NaiveDate> {
+    let zero_based = year * 12 + month as i32 - 1 + offset;
+    let next_year = zero_based.div_euclid(12);
+    let next_month = zero_based.rem_euclid(12) as u32 + 1;
+    NaiveDate::from_ymd_opt(next_year, next_month, 1)
+}
+
+fn format_period_range(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+    let end_inclusive = end - ChronoDuration::seconds(1);
+    format!(
+        "{} · {}",
+        start.with_timezone(&Local).format("%Y-%m-%d"),
+        end_inclusive.with_timezone(&Local).format("%Y-%m-%d")
+    )
+}
+
+fn token_period_ranges() -> Vec<(&'static str, &'static str, DateTime<Utc>, DateTime<Utc>)> {
+    let today = Local::now().date_naive();
+    let week_start = today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
+    let this_month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
+        .unwrap_or(today);
+    let last_month_start = add_months(this_month_start.year(), this_month_start.month(), -1)
+        .unwrap_or(this_month_start);
+    let next_month_start = add_months(this_month_start.year(), this_month_start.month(), 1)
+        .unwrap_or(this_month_start);
+
+    [
+        ("thisWeek", "本周", week_start, week_start + ChronoDuration::days(7)),
+        ("lastWeek", "上周", week_start - ChronoDuration::days(7), week_start),
+        ("thisMonth", "本月", this_month_start, next_month_start),
+        ("lastMonth", "上月", last_month_start, this_month_start),
+    ]
+    .into_iter()
+    .filter_map(|(id, label, start, end)| Some((id, label, local_midnight_utc(start)?, local_midnight_utc(end)?)))
+    .collect()
+}
+
+fn build_token_periods(events: &[TokenCountEvent]) -> Vec<TokenPeriodUsage> {
+    token_period_ranges()
+        .into_iter()
+        .map(|(id, label, start, end)| {
+            let mut token_usage = empty_token_usage();
+            let mut latest_time: Option<DateTime<Utc>> = None;
+            let mut has_data = false;
+
+            for event in events {
+                let Some(event_time) = token_event_time(event) else {
+                    continue;
+                };
+                if event_time < start || event_time >= end {
+                    continue;
+                }
+                let Some(usage) = token_usage_from_session(Some(event)) else {
+                    continue;
+                };
+                merge_token_usage(&mut token_usage, &usage);
+                latest_time = Some(latest_time.map_or(event_time, |latest| latest.max(event_time)));
+                has_data = true;
+            }
+
+            TokenPeriodUsage {
+                id: id.to_string(),
+                label: label.to_string(),
+                range_label: format_period_range(start, end),
+                token_usage,
+                computed_at: latest_time.unwrap_or_else(Utc::now).to_rfc3339(),
+                has_data,
+            }
+        })
+        .collect()
+}
+
 fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, String> {
     let rate_limits = event
         .payload
@@ -345,6 +463,7 @@ fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, S
         source_path: event.source_path.display().to_string(),
         account_source: "usageFile".to_string(),
         cached_at: None,
+        token_periods: Vec::new(),
     })
 }
 
@@ -375,10 +494,12 @@ fn latest_token_count_in_file(path: &Path) -> Option<TokenCountEvent> {
     None
 }
 
-fn find_latest_token_count() -> Option<TokenCountEvent> {
-    let root = sessions_path()?;
+fn find_latest_token_counts() -> Vec<TokenCountEvent> {
+    let Some(root) = sessions_path() else {
+        return Vec::new();
+    };
     if !root.exists() {
-        return None;
+        return Vec::new();
     }
 
     let mut candidates: Vec<_> = WalkDir::new(root)
@@ -394,18 +515,18 @@ fn find_latest_token_count() -> Option<TokenCountEvent> {
 
     candidates.sort_by_key(|(_, modified)| Reverse(*modified));
 
-    let mut latest: Option<TokenCountEvent> = None;
-    let mut latest_time = String::new();
-    for (path, _) in candidates.into_iter().take(MAX_SESSION_FILES_TO_SCAN) {
-        let Some(event) = latest_token_count_in_file(&path) else {
-            continue;
-        };
-        if event.timestamp > latest_time {
-            latest_time = event.timestamp.clone();
-            latest = Some(event);
-        }
-    }
-    latest
+    candidates
+        .into_iter()
+        .take(MAX_SESSION_FILES_TO_SCAN)
+        .filter_map(|(path, _)| latest_token_count_in_file(&path))
+        .collect()
+}
+
+fn find_latest_token_count(events: &[TokenCountEvent]) -> Option<TokenCountEvent> {
+    events
+        .iter()
+        .max_by_key(|event| event.timestamp.as_str())
+        .cloned()
 }
 
 fn find_codex_cli_path() -> Option<PathBuf> {
@@ -1050,6 +1171,7 @@ fn snapshot_from_app_server(app_server: Value, session_token: Option<TokenUsage>
         source_path: "codex app-server".to_string(),
         account_source: "codexAppServer".to_string(),
         cached_at: None,
+        token_periods: Vec::new(),
     };
 
     Some(DiscoveredSnapshot {
@@ -1111,7 +1233,8 @@ fn get_cached_usage_snapshot(app: AppHandle) -> Result<Option<UsageSnapshot>, St
 #[tauri::command]
 async fn get_usage_snapshot(app: AppHandle) -> Result<UsageSnapshot, String> {
     let explicit = read_explicit_snapshot(&app);
-    let latest_session = find_latest_token_count();
+    let session_events = find_latest_token_counts();
+    let latest_session = find_latest_token_count(&session_events);
     let session_token = token_usage_from_session(latest_session.as_ref());
     let official = if explicit.is_none() {
         read_codex_app_server().and_then(|value| snapshot_from_app_server(value, session_token))
@@ -1134,6 +1257,9 @@ async fn get_usage_snapshot(app: AppHandle) -> Result<UsageSnapshot, String> {
     let mut snapshot = discovered.snapshot;
     snapshot.source_path = discovered.source_path;
     snapshot.account_source = discovered.account_source;
+    if snapshot.token_periods.is_empty() {
+        snapshot.token_periods = build_token_periods(&session_events);
+    }
     if snapshot.account_source == "codexAppServer" {
         let (reset_credits, resets) = fetch_reset_credits_from_chatgpt()
             .map_err(|error| format!("读取重置机会失败: {error}"))?;

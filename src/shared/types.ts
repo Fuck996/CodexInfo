@@ -18,6 +18,17 @@ export type TokenUsage = {
   limit: number | null;
 };
 
+export type TokenPeriodId = "thisWeek" | "lastWeek" | "thisMonth" | "lastMonth";
+
+export type TokenPeriodUsage = {
+  id: TokenPeriodId;
+  label: string;
+  rangeLabel: string;
+  tokenUsage: TokenUsage;
+  computedAt: string;
+  hasData: boolean;
+};
+
 export type ResetChance = {
   id: string;
   label: string;
@@ -41,6 +52,7 @@ export type UsageSnapshot = {
   sourcePath: string;
   accountSource: "codexAppServer" | "codexAuth" | "usageFile";
   cachedAt?: string;
+  tokenPeriods?: TokenPeriodUsage[];
 };
 
 export type AppSettings = {
