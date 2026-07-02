@@ -71,6 +71,17 @@ npm run dist:win
 - `release/CodexInfo.exe`
 - `release/CodexInfo_1.0.0_x64-setup.exe`
 
+## 自动发布
+
+推送版本 tag 会自动触发 GitHub Actions 构建 Windows 版本并上传到对应 Release：
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+tag 必须与 `package.json` 里的版本一致，例如 `1.0.0` 对应 `v1.0.0`。也可以在 GitHub Actions 页面手动运行 `Release Windows Build`。
+
 ## 技术栈
 
 - Tauri 2
@@ -162,6 +173,17 @@ Build artifacts are copied to the root `release/` directory:
 
 - `release/CodexInfo.exe`
 - `release/CodexInfo_1.0.0_x64-setup.exe`
+
+## Release Automation
+
+Pushing a version tag triggers GitHub Actions to build the Windows artifacts and upload them to the matching GitHub Release:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The tag must match the version in `package.json`, for example `1.0.0` maps to `v1.0.0`. You can also run `Release Windows Build` manually from the GitHub Actions page.
 
 ## Tech Stack
 

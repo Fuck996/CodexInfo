@@ -1,0 +1,91 @@
+name: Release Windows Build
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0. Leave empty to use package.json version."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build and Upload Windows Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Setup Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis -y --no-progress
+
+      - name: Resolve release tag
+        shell: pwsh
+        run: |
+          $packageVersion = (Get-Content package.json | ConvertFrom-Json).version
+          $releaseTag = "${{ github.event.inputs.tag || '' }}"
+          if ([string]::IsNullOrWhiteSpace($releaseTag)) {
+            if ("${{ github.ref_type }}" -eq "tag") {
+              $releaseTag = "${{ github.ref_name }}"
+            } else {
+              $releaseTag = "v$packageVersion"
+            }
+          }
+
+          if ($releaseTag -ne "v$packageVersion") {
+            throw "Release tag $releaseTag does not match package.json version v$packageVersion."
+          }
+
+          "RELEASE_TAG=$releaseTag" >> $env:GITHUB_ENV
+          "PACKAGE_VERSION=$packageVersion" >> $env:GITHUB_ENV
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows artifacts
+        run: npm run dist:win
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          $portable = "release/CodexInfo.exe"
+          $installer = "release/CodexInfo_${env:PACKAGE_VERSION}_x64-setup.exe"
+          if (!(Test-Path $portable)) {
+            throw "Missing portable executable: $portable"
+          }
+          if (!(Test-Path $installer)) {
+            throw "Missing installer: $installer"
+          }
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: CodexInfo ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            release/CodexInfo.exe
+            release/CodexInfo_${{ env.PACKAGE_VERSION }}_x64-setup.exe
