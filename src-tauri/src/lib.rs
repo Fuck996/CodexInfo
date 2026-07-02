@@ -1066,6 +1066,36 @@ fn keep_dock_window_topmost(window: &WebviewWindow) {
     let _ = window.set_always_on_top(true);
 }
 
+#[cfg(target_os = "windows")]
+fn dock_is_clear_of_tray(window: &WebviewWindow, scale_factor: f64) -> bool {
+    let Some(tray) = tray_notify_rect() else {
+        return false;
+    };
+    let Ok(position) = window.outer_position() else {
+        return false;
+    };
+    let Ok(size) = window.outer_size() else {
+        return false;
+    };
+
+    let gap = (DOCK_TRAY_GAP * scale_factor).round() as i32;
+    let dock_left = position.x;
+    let dock_right = position.x + size.width as i32;
+    let dock_top = position.y;
+    let dock_bottom = position.y + size.height as i32;
+    let vertically_overlaps = dock_bottom > tray.top && dock_top < tray.bottom;
+    if !vertically_overlaps {
+        return true;
+    }
+
+    dock_right + gap <= tray.left || dock_left >= tray.right + gap
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dock_is_clear_of_tray(_: &WebviewWindow, _: f64) -> bool {
+    true
+}
+
 fn dock_position_is_stable(state: &AppState, position: tauri::PhysicalPosition<f64>, force: bool) -> bool {
     if force {
         if let Ok(mut pending) = state.dock_pending_position.lock() {
@@ -1106,19 +1136,32 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
     let visible = window.is_visible().unwrap_or(false);
 
     if enabled {
-        if let Some(position) = dock_position(app) {
-            if dock_position_is_stable(state, position, force) {
-                let target_x = position.x.round() as i32;
-                let target_y = position.y.round() as i32;
-                let should_move = window
-                    .outer_position()
-                    .map(|current| (current.x - target_x).abs() > 1 || (current.y - target_y).abs() > 1)
-                    .unwrap_or(true);
-                if should_move {
-                    move_dock_window(&window, position);
+        let scale_factor = app
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| monitor.scale_factor())
+            .unwrap_or(1.0);
+        let should_check_position = force || !visible || !dock_is_clear_of_tray(&window, scale_factor);
+
+        if should_check_position {
+            if let Some(position) = dock_position(app) {
+                if dock_position_is_stable(state, position, force) {
+                    let target_x = position.x.round() as i32;
+                    let target_y = position.y.round() as i32;
+                    let should_move = window
+                        .outer_position()
+                        .map(|current| (current.x - target_x).abs() > 1 || (current.y - target_y).abs() > 1)
+                        .unwrap_or(true);
+                    if should_move {
+                        move_dock_window(&window, position);
+                    }
                 }
             }
+        } else if let Ok(mut pending) = state.dock_pending_position.lock() {
+            *pending = None;
         }
+
         if !visible {
             let _ = window.set_skip_taskbar(true);
             let _ = window.set_shadow(false);
