@@ -34,8 +34,8 @@ use windows::{
     Win32::{
         Foundation::RECT,
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetWindowLongPtrW, GetWindowRect, SetWindowPos, GWL_EXSTYLE,
-            HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_TOPMOST,
+            FindWindowExW, FindWindowW, GetWindowRect, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE,
         },
     },
 };
@@ -1062,10 +1062,6 @@ fn show_dock_window(window: &WebviewWindow) {
 fn keep_dock_window_topmost(window: &WebviewWindow) {
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
-            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            if ex_style & WS_EX_TOPMOST.0 != 0 {
-                return;
-            }
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
