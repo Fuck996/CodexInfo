@@ -1653,18 +1653,63 @@ fn set_taskbar_usage_enabled(app: AppHandle, enabled: bool) -> Result<AppSetting
     get_settings(app)
 }
 
+fn expanded_position_anchor(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    scale_factor: f64,
+    target_height: f64,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    let current_position = window.outer_position().ok()?;
+    let current_size = window.outer_size().ok()?;
+    let monitor = app.primary_monitor().ok().flatten()?;
+    let work_area = monitor.work_area();
+    let monitor_position = monitor.position();
+    let edge_gap = (DOCK_EDGE_GAP * monitor.scale_factor()).round() as i32;
+    let work_left = work_area.position.x;
+    let work_top = work_area.position.y;
+    let work_right = work_left + work_area.size.width as i32;
+    let work_bottom = work_top + work_area.size.height as i32;
+    let top_taskbar = work_top - monitor_position.y > edge_gap;
+    let target_height = (target_height * scale_factor).round() as i32;
+    let target_width = (COLLAPSED_WIDTH * scale_factor).round() as i32;
+
+    let x = current_position
+        .x
+        .max(work_left + edge_gap)
+        .min((work_right - target_width - edge_gap).max(work_left + edge_gap));
+    let y = if top_taskbar {
+        current_position.y.max(work_top + edge_gap)
+    } else {
+        let current_bottom = current_position.y + current_size.height as i32;
+        (current_bottom - target_height).max(work_top + edge_gap)
+    }
+    .min((work_bottom - target_height).max(work_top + edge_gap));
+
+    Some(tauri::PhysicalPosition::new(x, y))
+}
+
 #[tauri::command]
 fn set_expanded(app: AppHandle, expanded: bool, extra_height: Option<u32>) -> Result<(), String> {
     let Some(window) = app.get_webview_window("main") else {
         return Ok(());
     };
+    let scale_factor = window.scale_factor().unwrap_or(1.0);
+    let target_height = if expanded {
+        (COLLAPSED_HEIGHT + extra_height.unwrap_or(0) as f64).min(MAX_EXPANDED_HEIGHT)
+    } else {
+        COLLAPSED_HEIGHT
+    };
     let size = if expanded {
-        let height = (COLLAPSED_HEIGHT + extra_height.unwrap_or(0) as f64).min(MAX_EXPANDED_HEIGHT);
-        tauri::LogicalSize::new(COLLAPSED_WIDTH, height)
+        tauri::LogicalSize::new(COLLAPSED_WIDTH, target_height)
     } else {
         tauri::LogicalSize::new(COLLAPSED_WIDTH, COLLAPSED_HEIGHT)
     };
+    let anchored_position = expanded_position_anchor(&app, &window, scale_factor, target_height);
     window.set_size(size).map_err(|error| error.to_string())?;
+    if let Some(position) = anchored_position {
+        let _ = window.set_position(position);
+        return Ok(());
+    }
     let state = app.state::<AppState>();
     if state.hover_component_visible.load(Ordering::Relaxed) {
         position_hover_component(&app, &window);
