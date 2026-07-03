@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { TokenPeriodId, TokenPeriodUsage, TokenUsage, UsageSnapshot, UsageWindow } from "../shared/types";
 import { desktopApi } from "./desktopApi";
-import appIcon from "../../src-tauri/icons/32x32.png";
+import dockIcon from "./assets/dock-icon.png";
 
 const refreshIntervalMs = 60_000;
 const apiCostPanelExtraHeight = 180;
@@ -19,10 +19,10 @@ const moneyFormatter = new Intl.NumberFormat("en-US", {
 type ApiCostPeriod = TokenPeriodId;
 
 const apiCostPeriods: Array<{ id: ApiCostPeriod; label: string }> = [
-  { id: "thisWeek", label: "近 7 天" },
-  { id: "lastWeek", label: "前 7 天" },
-  { id: "thisMonth", label: "近 30 天" },
-  { id: "lastMonth", label: "前 30 天" }
+  { id: "thisWeek", label: "本周" },
+  { id: "lastWeek", label: "上周" },
+  { id: "thisMonth", label: "本月" },
+  { id: "lastMonth", label: "上月" }
 ];
 const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
@@ -415,7 +415,7 @@ function DockBar({
       }}
     >
       <section className="dock-widget" aria-label="Codex 用量悬浮条">
-        <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={appIcon} alt="" />
+        <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={dockIcon} alt="" />
         <div className="dock-meters">
           <DockMeter window={fiveHour} label="5 小时" resetText={fiveHour ? formatClock(fiveHour.resetAt) : "--"} />
           <DockMeter window={sevenDay} label="每周" resetText={sevenDay ? formatResetDistance(sevenDay.resetAt) : "--"} />
@@ -620,7 +620,7 @@ function TokenBlock({
             <span className="token-chevron">{expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</span>
           </div>
           <strong>{moneyFormatter.format(currentCost.estimated)}</strong>
-          <small>{selectedPeriod?.label ?? "近 7 天"}</small>
+          <small>{selectedPeriod?.label ?? "本周"}</small>
         </button>
       </div>
       {expanded && (

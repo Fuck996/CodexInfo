@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
 use reqwest::{blocking::Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -385,15 +385,38 @@ fn format_period_range(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
     )
 }
 
+fn local_midnight_utc(date: NaiveDate) -> Option<DateTime<Utc>> {
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    Local
+        .from_local_datetime(&midnight)
+        .earliest()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn add_months(year: i32, month: u32, offset: i32) -> Option<NaiveDate> {
+    let zero_based = year * 12 + month as i32 - 1 + offset;
+    let next_year = zero_based.div_euclid(12);
+    let next_month = zero_based.rem_euclid(12) as u32 + 1;
+    NaiveDate::from_ymd_opt(next_year, next_month, 1)
+}
+
 fn token_period_ranges() -> Vec<(&'static str, &'static str, DateTime<Utc>, DateTime<Utc>)> {
-    let now = Utc::now();
+    let today = Local::now().date_naive();
+    let week_start = today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
+    let this_month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+    let last_month_start = add_months(this_month_start.year(), this_month_start.month(), -1)
+        .unwrap_or(this_month_start);
+    let next_month_start = add_months(this_month_start.year(), this_month_start.month(), 1)
+        .unwrap_or(this_month_start);
+
     [
-        ("thisWeek", "近 7 天", now - ChronoDuration::days(7), now),
-        ("lastWeek", "前 7 天", now - ChronoDuration::days(14), now - ChronoDuration::days(7)),
-        ("thisMonth", "近 30 天", now - ChronoDuration::days(30), now),
-        ("lastMonth", "前 30 天", now - ChronoDuration::days(60), now - ChronoDuration::days(30)),
+        ("thisWeek", "本周", week_start, week_start + ChronoDuration::days(7)),
+        ("lastWeek", "上周", week_start - ChronoDuration::days(7), week_start),
+        ("thisMonth", "本月", this_month_start, next_month_start),
+        ("lastMonth", "上月", last_month_start, this_month_start),
     ]
     .into_iter()
+    .filter_map(|(id, label, start, end)| Some((id, label, local_midnight_utc(start)?, local_midnight_utc(end)?)))
     .collect()
 }
 
