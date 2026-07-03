@@ -2017,14 +2017,31 @@ pub fn run() {
                 let _ = window.set_always_on_top(stored_settings.keep_always_on_top);
                 let _ = window.set_skip_taskbar(true);
                 let _ = window.set_size(tauri::LogicalSize::new(COLLAPSED_WIDTH, COLLAPSED_HEIGHT));
-                if stored_settings.main_visible && !dock_enabled {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                } else {
+                if !stored_settings.main_visible {
                     let _ = window.hide();
                 }
             }
             update_dock_window(app.handle(), &state, true);
+            if stored_settings.main_visible {
+                if let Some(window) = app.get_webview_window("main") {
+                    if dock_enabled {
+                        position_hover_component(app.handle(), &window);
+                    }
+                    show_window(&window);
+                }
+                let startup_app = app.handle().clone();
+                let startup_state = state.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(300));
+                    update_dock_window(&startup_app, &startup_state, true);
+                    if let Some(window) = startup_app.get_webview_window("main") {
+                        if dock_enabled {
+                            position_hover_component(&startup_app, &window);
+                        }
+                        show_window(&window);
+                    }
+                });
+            }
             let dock_app = app.handle().clone();
             let dock_state = state.clone();
             thread::spawn(move || loop {
