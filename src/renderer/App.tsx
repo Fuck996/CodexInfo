@@ -143,6 +143,14 @@ function formatFullDate(value: string) {
   return fullDateFormatter.format(date);
 }
 
+function subscriptionExpiryText(value: string | null | undefined) {
+  const raw = value?.trim();
+  if (!raw) {
+    return "未返回";
+  }
+  return formatDate(raw);
+}
+
 function periodStartLabel(value: string | undefined) {
   return value?.split(" · ")[0] ?? "";
 }
@@ -352,8 +360,8 @@ export function App() {
             <span>CODEX 用量核心</span>
           </div>
           <div className="plan-meta">
-            {snapshot?.subscriptionExpiresAt && (
-              <span className="subscription-inline">到期 {formatDate(snapshot.subscriptionExpiresAt)}</span>
+            {snapshot && (
+              <span className="subscription-inline">到期 {subscriptionExpiryText(snapshot.subscriptionExpiresAt)}</span>
             )}
             <span className="plan-badge">{compactPlanName(snapshot?.planName)}</span>
           </div>
@@ -369,12 +377,10 @@ export function App() {
 
             <TokenBlock expanded={tokenExpanded} onToggle={toggleTokenExpanded} snapshot={snapshot} tokenUsed={tokenUsed} />
 
-            {snapshot.subscriptionExpiresAt && (
-              <div className="subscription-strip">
-                <span>订阅到期</span>
-                <strong>{formatDate(snapshot.subscriptionExpiresAt)}</strong>
-              </div>
-            )}
+            <div className="subscription-strip">
+              <span>订阅到期</span>
+              <strong>{subscriptionExpiryText(snapshot.subscriptionExpiresAt)}</strong>
+            </div>
 
             {canExpand && (
               <ResetOverview

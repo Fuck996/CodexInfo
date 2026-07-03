@@ -626,7 +626,7 @@ fn read_codex_app_server() -> Option<Value> {
             _ => {}
         }
 
-        if rate_limits.is_some() {
+        if account.is_some() && rate_limits.is_some() {
             let _ = child.kill();
             return Some(json!({
                 "account": account,
@@ -637,7 +637,13 @@ fn read_codex_app_server() -> Option<Value> {
     }
 
     let _ = child.kill();
-    None
+    rate_limits.map(|rate_limits| {
+        json!({
+            "account": account,
+            "rateLimits": rate_limits,
+            "sourcePath": "codex app-server"
+        })
+    })
 }
 
 fn pick_codex_bucket(rate_limits: &Value) -> Option<&Value> {
