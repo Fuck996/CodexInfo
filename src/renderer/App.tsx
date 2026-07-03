@@ -19,10 +19,10 @@ const moneyFormatter = new Intl.NumberFormat("en-US", {
 type ApiCostPeriod = TokenPeriodId;
 
 const apiCostPeriods: Array<{ id: ApiCostPeriod; label: string }> = [
-  { id: "thisWeek", label: "本周" },
-  { id: "lastWeek", label: "上周" },
-  { id: "thisMonth", label: "本月" },
-  { id: "lastMonth", label: "上月" }
+  { id: "thisWeek", label: "近 7 天" },
+  { id: "lastWeek", label: "前 7 天" },
+  { id: "thisMonth", label: "近 30 天" },
+  { id: "lastMonth", label: "前 30 天" }
 ];
 const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
@@ -620,7 +620,7 @@ function TokenBlock({
             <span className="token-chevron">{expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</span>
           </div>
           <strong>{moneyFormatter.format(currentCost.estimated)}</strong>
-          <small>{selectedPeriod?.label ?? "本周"}</small>
+          <small>{selectedPeriod?.label ?? "近 7 天"}</small>
         </button>
       </div>
       {expanded && (

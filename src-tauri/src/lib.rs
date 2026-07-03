@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use reqwest::{blocking::Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -196,6 +196,12 @@ struct TokenCountEvent {
     source_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct TokenUsageSample {
+    timestamp: String,
+    token_usage: TokenUsage,
+}
+
 fn codex_root() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".codex"))
 }
@@ -300,24 +306,29 @@ fn session_window_to_usage(id: &str, label: &str, value: Option<&Value>) -> Opti
     })
 }
 
-fn token_usage_from_session(event: Option<&TokenCountEvent>) -> Option<TokenUsage> {
-    let payload = &event?.payload;
-    let stats = payload.get("info")?.get("total_token_usage")?;
+fn token_usage_from_stats(stats: &Value) -> TokenUsage {
     let input = stats.get("input_tokens").and_then(number).unwrap_or(0.0);
     let cached_input = stats.get("cached_input_tokens").and_then(number).unwrap_or(0.0);
     let output = stats.get("output_tokens").and_then(number).unwrap_or(0.0);
     let reasoning_output = stats.get("reasoning_output_tokens").and_then(number).unwrap_or(0.0);
-    let output_total = output + reasoning_output;
-    let total = stats.get("total_tokens").and_then(number).unwrap_or(input + output_total);
+    let total = stats.get("total_tokens").and_then(number).unwrap_or(input + output);
 
-    Some(TokenUsage {
+    TokenUsage {
         input: Some(input),
         cached_input: Some(cached_input),
-        output: Some(output_total),
+        output: Some(output),
         reasoning_output: Some(reasoning_output),
         total: Some(total),
         limit: None,
-    })
+    }
+}
+
+fn token_usage_from_session(event: Option<&TokenCountEvent>) -> Option<TokenUsage> {
+    let payload = &event?.payload;
+    payload
+        .get("info")?
+        .get("total_token_usage")
+        .map(token_usage_from_stats)
 }
 
 fn empty_token_usage() -> TokenUsage {
@@ -339,25 +350,30 @@ fn merge_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
     total.total = Some(total.total.unwrap_or(0.0) + usage.total.unwrap_or(0.0));
 }
 
-fn token_event_time(event: &TokenCountEvent) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(&event.timestamp)
-        .ok()
-        .map(|time| time.with_timezone(&Utc))
+fn token_usage_delta(current: &TokenUsage, previous: Option<&TokenUsage>) -> TokenUsage {
+    let Some(previous) = previous else {
+        return current.clone();
+    };
+
+    let delta = |current: Option<f64>, previous: Option<f64>| {
+        Some((current.unwrap_or(0.0) - previous.unwrap_or(0.0)).max(0.0))
+    };
+
+    TokenUsage {
+        input: delta(current.input, previous.input),
+        cached_input: delta(current.cached_input, previous.cached_input),
+        output: delta(current.output, previous.output),
+        reasoning_output: delta(current.reasoning_output, previous.reasoning_output),
+        total: delta(current.total, previous.total),
+        limit: None,
+    }
 }
 
-fn local_midnight_utc(date: NaiveDate) -> Option<DateTime<Utc>> {
-    let midnight = date.and_hms_opt(0, 0, 0)?;
-    Local
-        .from_local_datetime(&midnight)
-        .earliest()
-        .map(|time| time.with_timezone(&Utc))
-}
-
-fn add_months(year: i32, month: u32, offset: i32) -> Option<NaiveDate> {
-    let zero_based = year * 12 + month as i32 - 1 + offset;
-    let next_year = zero_based.div_euclid(12);
-    let next_month = zero_based.rem_euclid(12) as u32 + 1;
-    NaiveDate::from_ymd_opt(next_year, next_month, 1)
+fn token_usage_has_positive_total(usage: &TokenUsage) -> bool {
+    usage.total.unwrap_or(0.0) > 0.0
+        || usage.input.unwrap_or(0.0) > 0.0
+        || usage.output.unwrap_or(0.0) > 0.0
+        || usage.cached_input.unwrap_or(0.0) > 0.0
 }
 
 fn format_period_range(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
@@ -370,27 +386,18 @@ fn format_period_range(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
 }
 
 fn token_period_ranges() -> Vec<(&'static str, &'static str, DateTime<Utc>, DateTime<Utc>)> {
-    let today = Local::now().date_naive();
-    let week_start = today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
-    let this_month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-        .unwrap_or(today);
-    let last_month_start = add_months(this_month_start.year(), this_month_start.month(), -1)
-        .unwrap_or(this_month_start);
-    let next_month_start = add_months(this_month_start.year(), this_month_start.month(), 1)
-        .unwrap_or(this_month_start);
-
+    let now = Utc::now();
     [
-        ("thisWeek", "本周", week_start, week_start + ChronoDuration::days(7)),
-        ("lastWeek", "上周", week_start - ChronoDuration::days(7), week_start),
-        ("thisMonth", "本月", this_month_start, next_month_start),
-        ("lastMonth", "上月", last_month_start, this_month_start),
+        ("thisWeek", "近 7 天", now - ChronoDuration::days(7), now),
+        ("lastWeek", "前 7 天", now - ChronoDuration::days(14), now - ChronoDuration::days(7)),
+        ("thisMonth", "近 30 天", now - ChronoDuration::days(30), now),
+        ("lastMonth", "前 30 天", now - ChronoDuration::days(60), now - ChronoDuration::days(30)),
     ]
     .into_iter()
-    .filter_map(|(id, label, start, end)| Some((id, label, local_midnight_utc(start)?, local_midnight_utc(end)?)))
     .collect()
 }
 
-fn build_token_periods(events: &[TokenCountEvent]) -> Vec<TokenPeriodUsage> {
+fn build_token_periods(samples: &[TokenUsageSample]) -> Vec<TokenPeriodUsage> {
     token_period_ranges()
         .into_iter()
         .map(|(id, label, start, end)| {
@@ -398,17 +405,17 @@ fn build_token_periods(events: &[TokenCountEvent]) -> Vec<TokenPeriodUsage> {
             let mut latest_time: Option<DateTime<Utc>> = None;
             let mut has_data = false;
 
-            for event in events {
-                let Some(event_time) = token_event_time(event) else {
+            for sample in samples {
+                let Some(event_time) = DateTime::parse_from_rfc3339(&sample.timestamp)
+                    .ok()
+                    .map(|time| time.with_timezone(&Utc))
+                else {
                     continue;
                 };
                 if event_time < start || event_time >= end {
                     continue;
                 }
-                let Some(usage) = token_usage_from_session(Some(event)) else {
-                    continue;
-                };
-                merge_token_usage(&mut token_usage, &usage);
+                merge_token_usage(&mut token_usage, &sample.token_usage);
                 latest_time = Some(latest_time.map_or(event_time, |latest| latest.max(event_time)));
                 has_data = true;
             }
@@ -473,7 +480,7 @@ fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, S
 }
 
 fn parse_token_count_line(line: &str, source_path: &Path) -> Option<TokenCountEvent> {
-    if !line.contains("\"token_count\"") || !line.contains("\"rate_limits\"") {
+    if !line.contains("\"token_count\"") {
         return None;
     }
 
@@ -489,6 +496,62 @@ fn parse_token_count_line(line: &str, source_path: &Path) -> Option<TokenCountEv
     })
 }
 
+fn token_usage_total_value(usage: &TokenUsage) -> f64 {
+    usage.total.unwrap_or_else(|| {
+        usage.input.unwrap_or(0.0)
+            + usage.output.unwrap_or(0.0)
+            + usage.cached_input.unwrap_or(0.0)
+    })
+}
+
+fn token_usage_samples_in_file(path: &Path) -> Vec<TokenUsageSample> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let mut samples = Vec::new();
+    let mut previous_total: Option<TokenUsage> = None;
+
+    for line in content.lines() {
+        let Some(event) = parse_token_count_line(line, path) else {
+            continue;
+        };
+        let Some(info) = event.payload.get("info") else {
+            continue;
+        };
+
+        let usage = if let Some(total_usage) = info.get("total_token_usage") {
+            let current_total = token_usage_from_stats(total_usage);
+            let usage = if previous_total
+                .as_ref()
+                .map(|previous| token_usage_total_value(&current_total) < token_usage_total_value(previous))
+                .unwrap_or(false)
+            {
+                info.get("last_token_usage")
+                    .map(token_usage_from_stats)
+                    .unwrap_or_else(|| current_total.clone())
+            } else {
+                token_usage_delta(&current_total, previous_total.as_ref())
+            };
+            previous_total = Some(current_total);
+            usage
+        } else if let Some(last_usage) = info.get("last_token_usage") {
+            token_usage_from_stats(last_usage)
+        } else {
+            continue;
+        };
+
+        if token_usage_has_positive_total(&usage) {
+            samples.push(TokenUsageSample {
+                timestamp: event.timestamp,
+                token_usage: usage,
+            });
+        }
+    }
+
+    samples
+}
+
 fn latest_token_count_in_file(path: &Path) -> Option<TokenCountEvent> {
     let content = fs::read_to_string(path).ok()?;
     for line in content.lines().rev() {
@@ -499,7 +562,7 @@ fn latest_token_count_in_file(path: &Path) -> Option<TokenCountEvent> {
     None
 }
 
-fn find_latest_token_counts() -> Vec<TokenCountEvent> {
+fn recent_session_files() -> Vec<PathBuf> {
     let Some(root) = sessions_path() else {
         return Vec::new();
     };
@@ -519,11 +582,24 @@ fn find_latest_token_counts() -> Vec<TokenCountEvent> {
         .collect();
 
     candidates.sort_by_key(|(_, modified)| Reverse(*modified));
-
     candidates
         .into_iter()
         .take(MAX_SESSION_FILES_TO_SCAN)
-        .filter_map(|(path, _)| latest_token_count_in_file(&path))
+        .map(|(path, _)| path)
+        .collect()
+}
+
+fn find_latest_token_counts() -> Vec<TokenCountEvent> {
+    recent_session_files()
+        .into_iter()
+        .filter_map(|path| latest_token_count_in_file(&path))
+        .collect()
+}
+
+fn find_token_usage_samples() -> Vec<TokenUsageSample> {
+    recent_session_files()
+        .into_iter()
+        .flat_map(|path| token_usage_samples_in_file(&path))
         .collect()
 }
 
@@ -1449,6 +1525,7 @@ async fn get_usage_snapshot(app: AppHandle) -> Result<UsageSnapshot, String> {
 fn get_usage_snapshot_blocking(app: AppHandle) -> Result<UsageSnapshot, String> {
     let explicit = read_explicit_snapshot(&app);
     let session_events = find_latest_token_counts();
+    let token_samples = find_token_usage_samples();
     let latest_session = find_latest_token_count(&session_events);
     let session_token = token_usage_from_session(latest_session.as_ref());
     let official = if explicit.is_none() {
@@ -1473,7 +1550,7 @@ fn get_usage_snapshot_blocking(app: AppHandle) -> Result<UsageSnapshot, String> 
     snapshot.source_path = discovered.source_path;
     snapshot.account_source = discovered.account_source;
     if snapshot.token_periods.is_empty() {
-        snapshot.token_periods = build_token_periods(&session_events);
+        snapshot.token_periods = build_token_periods(&token_samples);
     }
     if snapshot.account_source == "codexAppServer" {
         let (reset_credits, resets) = fetch_reset_credits_from_chatgpt()
