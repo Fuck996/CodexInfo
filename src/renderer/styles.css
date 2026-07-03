@@ -179,7 +179,6 @@ button {
 .token-section,
 .token-block,
 .api-summary-card,
-.subscription-strip,
 .reset-overview,
 .reset-detail-panel,
 .error-panel {
@@ -218,14 +217,6 @@ button {
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
-}
-
-.subscription-inline {
-  overflow: hidden;
-  color: var(--muted-strong);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .status-dot {
@@ -275,8 +266,7 @@ button {
 
 .usage-card,
 .token-block,
-.api-summary-card,
-.subscription-strip {
+.api-summary-card {
   border: 1px solid rgba(255, 255, 255, 0.11);
   border-radius: 8px;
   background:
@@ -590,24 +580,6 @@ button {
   color: var(--text);
   font-size: 12px;
   text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.subscription-strip {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 39px;
-  margin: 10px 16px 0;
-  padding: 0 12px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.subscription-strip strong {
-  color: var(--accent);
-  font-size: 13px;
   white-space: nowrap;
 }
 

@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-CodexInfo is a Windows desktop usage widget for Codex. It displays local Codex 5-hour usage, 7-day usage, reset times, reset credits, subscription expiration, Token usage, and estimated API-equivalent cost.
+CodexInfo is a Windows desktop usage widget for Codex. It displays local Codex 5-hour usage, 7-day usage, reset times, reset credits, plan name, Token usage, and estimated API-equivalent cost.
 
 The UI uses a black translucent glass style, orange highlights, and a pixel-style font. By default, the app only shows a compact taskbar dock. Hovering over the dock opens the full widget above the taskbar; moving the cursor away from both the dock and the widget collapses it automatically.
 
@@ -12,7 +12,7 @@ The UI uses a black translucent glass style, orange highlights, and a pixel-styl
 - Taskbar dock: compact usage bars and reset information, configurable from the context menu.
 - Hover widget: opens from the dock, collapses automatically, and remembers the previous expanded state.
 - Reset credits: shows available count, expiring soon, total remaining time, nearest expiration, and per-credit expiration details.
-- Subscription info: displays plan name and subscription expiration time.
+- Subscription info: displays plan name.
 - Token and API-equivalent cost: Token values support Chinese `万` / `亿` units; clicking the Token area expands weekly and monthly API-equivalent cost.
 - Tray menu: show widget, keep always on top, show usage in tray, show taskbar entry, launch at startup, and quit.
 - Local cache: shows the last cached data on startup, then refreshes automatically after fresh data is loaded.
