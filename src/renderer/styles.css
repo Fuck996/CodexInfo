@@ -191,6 +191,7 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   height: 40px;
   padding: 0 16px;
   border-bottom: 1px solid var(--line-quiet);
@@ -204,9 +205,27 @@ button {
 }
 
 .brand {
+  flex: 1 1 auto;
   min-width: 0;
   color: var(--muted);
   font-size: 12px;
+}
+
+.plan-meta {
+  flex: 0 1 auto;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.subscription-inline {
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-dot {
@@ -233,6 +252,7 @@ button {
 
 .plan-badge {
   max-width: 150px;
+  flex: 0 1 auto;
   overflow: hidden;
   padding: 4px 9px;
   border: 1px solid rgba(255, 65, 86, 0.58);

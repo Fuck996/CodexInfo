@@ -11,7 +11,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc,
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::Duration,
@@ -32,10 +32,12 @@ use walkdir::WalkDir;
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::RECT,
+        Foundation::{HWND, RECT},
+        UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetWindowRect, SetWindowPos, HWND_TOP, HWND_TOPMOST,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetWindowRect, SetWindowPos,
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, HWND_TOP, HWND_TOPMOST, MSG,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINEVENT_OUTOFCONTEXT,
         },
     },
 };
@@ -51,6 +53,8 @@ const APP_SERVER_TIMEOUT_MS: u64 = 8_000;
 const MAX_SESSION_FILES_TO_SCAN: usize = 120;
 const CHATGPT_BACKEND_URL: &str = "https://chatgpt.com/backend-api";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+#[cfg(target_os = "windows")]
+static DOCK_Z_ORDER_EVENTS: OnceLock<mpsc::Sender<()>> = OnceLock::new();
 
 #[derive(Clone)]
 struct AppState {
@@ -1089,6 +1093,95 @@ fn keep_dock_window_topmost(window: &WebviewWindow) {
     let _ = window.set_always_on_top(true);
 }
 
+fn refresh_dock_z_order(app: &AppHandle, state: &AppState) {
+    if !state.dock_enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(window) = app.get_webview_window("dock") else {
+        return;
+    };
+
+    configure_dock_window_style(&window);
+    if !window.is_visible().unwrap_or(false) {
+        show_dock_window(&window);
+    }
+    keep_dock_window_topmost(&window);
+}
+
+#[cfg(target_os = "windows")]
+fn watched_shell_window(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+
+    let mut class_name = [0u16; 128];
+    let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
+    if len <= 0 {
+        return false;
+    }
+
+    matches!(
+        String::from_utf16_lossy(&class_name[..len as usize]).as_str(),
+        "Shell_TrayWnd" | "TrayNotifyWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland"
+    )
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn dock_z_order_event_proc(
+    _: HWINEVENTHOOK,
+    _: u32,
+    hwnd: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    if watched_shell_window(hwnd) {
+        if let Some(sender) = DOCK_Z_ORDER_EVENTS.get() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_dock_z_order_watcher(app: AppHandle, state: AppState) {
+    let (tx, rx) = mpsc::channel::<()>();
+    let _ = DOCK_Z_ORDER_EVENTS.set(tx);
+
+    let pulse_app = app.clone();
+    let pulse_state = state.clone();
+    thread::spawn(move || {
+        while rx.recv().is_ok() {
+            for _ in 0..24 {
+                refresh_dock_z_order(&pulse_app, &pulse_state);
+                thread::sleep(Duration::from_millis(16));
+            }
+            while rx.try_recv().is_ok() {}
+        }
+    });
+
+    thread::spawn(move || unsafe {
+        let hook = SetWinEventHook(
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            None,
+            Some(dock_z_order_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        if hook.0.is_null() {
+            return;
+        }
+
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).as_bool() {}
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_dock_z_order_watcher(_: AppHandle, _: AppState) {}
+
 #[cfg(target_os = "windows")]
 fn dock_is_clear_of_tray(window: &WebviewWindow, scale_factor: f64) -> bool {
     let Some(tray) = tray_notify_rect() else {
@@ -1932,6 +2025,7 @@ pub fn run() {
                 thread::sleep(Duration::from_millis(750));
                 update_dock_window(&dock_app, &dock_state, false);
             });
+            start_dock_z_order_watcher(app.handle().clone(), state.clone());
             Ok(())
         })
         .on_window_event(move |window, event| {

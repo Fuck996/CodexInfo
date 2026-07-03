@@ -23,7 +23,7 @@ CodexInfo 是一个 Windows 桌面用量组件，用来显示本机 Codex 的 5 
 请到 [GitHub Releases](https://github.com/Fuck996/CodexInfo/releases) 下载：
 
 - `CodexInfo.exe`：免安装运行版。
-- `CodexInfo_1.0.0_x64-setup.exe`：Windows 安装包。
+- `CodexInfo_<version>_x64-setup.exe`：Windows 安装包。
 
 ## 使用
 
@@ -61,18 +61,20 @@ npm run dist:win
 构建产物会复制到项目根目录的 `release/`：
 
 - `release/CodexInfo.exe`
-- `release/CodexInfo_1.0.0_x64-setup.exe`
+- `release/CodexInfo_<version>_x64-setup.exe`
 
 ## 自动发布
 
-推送版本 tag 会自动触发 GitHub Actions 构建 Windows 版本并上传到对应 Release：
+`npm run dist:win` 会先自动递增 patch 版本号，再同步 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json`，最后构建 Windows 产物。
+
+推送版本 tag 会自动触发 GitHub Actions 构建 Windows 版本并上传到 Release：
 
 ```powershell
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.0.1
+git push origin v1.0.1
 ```
 
-tag 必须与 `package.json` 里的版本一致，例如 `1.0.0` 对应 `v1.0.0`。也可以在 GitHub Actions 页面手动运行 `Release Windows Build`。
+Action 构建同样会执行版本递增，并使用递增后的 `package.json` 版本作为 Release tag。也可以在 GitHub Actions 页面手动运行 `Release Windows Build`。
 
 ## 技术栈
 

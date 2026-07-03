@@ -351,7 +351,12 @@ export function App() {
             <span className={`status-dot ${statusClass}`} title={statusTitle} />
             <span>CODEX 用量核心</span>
           </div>
-          <span className="plan-badge">{compactPlanName(snapshot?.planName)}</span>
+          <div className="plan-meta">
+            {snapshot?.subscriptionExpiresAt && (
+              <span className="subscription-inline">到期 {formatDate(snapshot.subscriptionExpiresAt)}</span>
+            )}
+            <span className="plan-badge">{compactPlanName(snapshot?.planName)}</span>
+          </div>
         </div>
 
         {snapshot ? (

@@ -39,31 +39,31 @@ jobs:
         shell: pwsh
         run: choco install nsis -y --no-progress
 
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows artifacts
+        run: npm run dist:win
+
       - name: Resolve release tag
         shell: pwsh
         run: |
           $packageVersion = (Get-Content package.json | ConvertFrom-Json).version
           $releaseTag = "${{ github.event.inputs.tag || '' }}"
           if ([string]::IsNullOrWhiteSpace($releaseTag)) {
-            if ("${{ github.ref_type }}" -eq "tag") {
-              $releaseTag = "${{ github.ref_name }}"
-            } else {
-              $releaseTag = "v$packageVersion"
-            }
+            $releaseTag = "v$packageVersion"
           }
 
           if ($releaseTag -ne "v$packageVersion") {
-            throw "Release tag $releaseTag does not match package.json version v$packageVersion."
+            throw "Release tag $releaseTag does not match bumped package.json version v$packageVersion."
+          }
+
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne $releaseTag) {
+            Write-Warning "Triggered by ${{ github.ref_name }}, publishing bumped version $releaseTag."
           }
 
           "RELEASE_TAG=$releaseTag" >> $env:GITHUB_ENV
           "PACKAGE_VERSION=$packageVersion" >> $env:GITHUB_ENV
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build Windows artifacts
-        run: npm run dist:win
 
       - name: Verify artifacts
         shell: pwsh

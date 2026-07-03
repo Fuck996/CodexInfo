@@ -1,6 +1,6 @@
 {
   "name": "codex-info",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Codex 用量桌面组件",
   "type": "module",
@@ -8,7 +8,8 @@
     "dev": "vite --host 127.0.0.1",
     "tauri:dev": "tauri dev",
     "build": "tsc --noEmit && vite build",
-    "dist:win": "tauri build --bundles nsis && node scripts/copy-release.mjs",
+    "version:bump": "node scripts/bump-version.mjs",
+    "dist:win": "npm run version:bump && tauri build --bundles nsis && node scripts/copy-release.mjs",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview --host 127.0.0.1"
   },

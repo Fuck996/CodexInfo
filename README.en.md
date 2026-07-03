@@ -23,7 +23,7 @@ The UI uses a black translucent glass style, orange highlights, and a pixel-styl
 Download from [GitHub Releases](https://github.com/Fuck996/CodexInfo/releases):
 
 - `CodexInfo.exe`: portable executable.
-- `CodexInfo_1.0.0_x64-setup.exe`: Windows installer.
+- `CodexInfo_<version>_x64-setup.exe`: Windows installer.
 
 ## Usage
 
@@ -61,18 +61,20 @@ npm run dist:win
 Build artifacts are copied to the root `release/` directory:
 
 - `release/CodexInfo.exe`
-- `release/CodexInfo_1.0.0_x64-setup.exe`
+- `release/CodexInfo_<version>_x64-setup.exe`
 
 ## Release Automation
 
-Pushing a version tag triggers GitHub Actions to build the Windows artifacts and upload them to the matching GitHub Release:
+`npm run dist:win` bumps the patch version first, syncs `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`, then builds the Windows artifacts.
+
+Pushing a version tag triggers GitHub Actions to build the Windows artifacts and upload them to a GitHub Release:
 
 ```powershell
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.0.1
+git push origin v1.0.1
 ```
 
-The tag must match the version in `package.json`, for example `1.0.0` maps to `v1.0.0`. You can also run `Release Windows Build` manually from the GitHub Actions page.
+The Action build runs the same version bump and uses the bumped `package.json` version as the Release tag. You can also run `Release Windows Build` manually from the GitHub Actions page.
 
 ## Tech Stack
 
