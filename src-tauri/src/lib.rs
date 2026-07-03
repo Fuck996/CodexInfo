@@ -34,8 +34,8 @@ use windows::{
     Win32::{
         Foundation::RECT,
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetWindowRect, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE,
+            FindWindowExW, FindWindowW, GetWindowRect, SetWindowPos, HWND_TOP, HWND_TOPMOST,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
         },
     },
 };
@@ -1065,6 +1065,15 @@ fn keep_dock_window_topmost(window: &WebviewWindow) {
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
                 0,
                 0,
                 0,
