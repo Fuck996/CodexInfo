@@ -2158,20 +2158,18 @@ pub fn run() {
             create_tray(app.handle(), state.clone())?;
             let stored_settings = read_stored_settings(app.handle()).unwrap_or_default();
             let dock_enabled = stored_settings.dock_enabled || stored_settings.taskbar_usage_enabled;
+            let show_main_on_startup = stored_settings.main_visible && !dock_enabled;
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(stored_settings.keep_always_on_top);
                 let _ = window.set_skip_taskbar(true);
                 let _ = window.set_size(tauri::LogicalSize::new(COLLAPSED_WIDTH, COLLAPSED_HEIGHT));
-                if !stored_settings.main_visible {
+                if !show_main_on_startup {
                     let _ = window.hide();
                 }
             }
             update_dock_window(app.handle(), &state, true);
-            if stored_settings.main_visible {
+            if show_main_on_startup {
                 if let Some(window) = app.get_webview_window("main") {
-                    if dock_enabled {
-                        position_hover_component(app.handle(), &window);
-                    }
                     show_window(&window);
                 }
                 let startup_app = app.handle().clone();
@@ -2180,9 +2178,6 @@ pub fn run() {
                     thread::sleep(Duration::from_millis(300));
                     update_dock_window(&startup_app, &startup_state, true);
                     if let Some(window) = startup_app.get_webview_window("main") {
-                        if dock_enabled {
-                            position_hover_component(&startup_app, &window);
-                        }
                         show_window(&window);
                     }
                 });
