@@ -35,9 +35,10 @@ use windows::{
         Foundation::{HWND, RECT},
         UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetWindowRect, SetWindowPos,
-            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, HWND_TOP, HWND_TOPMOST, MSG,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINEVENT_OUTOFCONTEXT,
+            FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetWindow, GetWindowRect,
+            SetWindowPos, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV,
+            HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+            WINEVENT_OUTOFCONTEXT,
         },
     },
 };
@@ -1142,12 +1143,12 @@ fn pin_dock_window(window: &WebviewWindow, position: tauri::PhysicalPosition<f64
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
+                None,
                 position.x.round() as i32,
                 position.y.round() as i32,
                 0,
                 0,
-                SWP_NOSIZE | SWP_NOACTIVATE,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
     }
@@ -1168,21 +1169,20 @@ fn show_dock_window(window: &WebviewWindow) {
 }
 
 #[cfg(target_os = "windows")]
-fn keep_dock_window_topmost(window: &WebviewWindow) {
+fn keep_dock_window_above_taskbar(window: &WebviewWindow) {
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
+            let Ok(taskbar) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) else {
+                return;
+            };
+            let window_above_taskbar = GetWindow(taskbar, GW_HWNDPREV).ok();
+            if window_above_taskbar == Some(hwnd) {
+                return;
+            }
+            let insert_after = window_above_taskbar.unwrap_or(HWND_TOPMOST);
             let _ = SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOP),
+                Some(insert_after),
                 0,
                 0,
                 0,
@@ -1194,7 +1194,7 @@ fn keep_dock_window_topmost(window: &WebviewWindow) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn keep_dock_window_topmost(window: &WebviewWindow) {
+fn keep_dock_window_above_taskbar(window: &WebviewWindow) {
     let _ = window.set_always_on_top(true);
 }
 
@@ -1210,7 +1210,7 @@ fn refresh_dock_z_order(app: &AppHandle, state: &AppState) {
     if !window.is_visible().unwrap_or(false) {
         show_dock_window(&window);
     }
-    keep_dock_window_topmost(&window);
+    keep_dock_window_above_taskbar(&window);
 }
 
 #[cfg(target_os = "windows")]
@@ -1387,7 +1387,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
         if !visible {
             show_dock_window(&window);
         }
-        keep_dock_window_topmost(&window);
+        keep_dock_window_above_taskbar(&window);
     } else if visible {
         let _ = window.hide();
     }
@@ -1973,9 +1973,6 @@ fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(next);
             }
-            if let Some(window) = app.get_webview_window("dock") {
-                let _ = window.set_always_on_top(next);
-            }
         }
         "tray_usage" => {
             let next = !state.tray_usage_enabled.load(Ordering::Relaxed);
@@ -2204,7 +2201,7 @@ pub fn run() {
                         if window_state.dock_enabled.load(Ordering::Relaxed) {
                             if let Some(dock) = app.get_webview_window("dock") {
                                 show_dock_window(&dock);
-                                keep_dock_window_topmost(&dock);
+                                keep_dock_window_above_taskbar(&dock);
                             }
                         } else {
                             let _ = window.hide();
