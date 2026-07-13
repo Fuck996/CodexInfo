@@ -1,6 +1,6 @@
 [package]
 name = "codex-info"
-version = "1.0.9"
+version = "1.0.10"
 description = "Codex usage desktop widget"
 authors = ["CodexInfo"]
 edition = "2021"
