@@ -33,12 +33,21 @@ use windows::{
     core::{w, PCWSTR},
     Win32::{
         Foundation::{HWND, RECT},
+        Graphics::{
+            Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS},
+            Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+        },
         UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
+        UI::Shell::{
+            SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE,
+            QUNS_RUNNING_D3D_FULL_SCREEN,
+        },
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetWindow, GetWindowRect,
-            SetWindowPos, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV,
-            HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-            WINEVENT_OUTOFCONTEXT,
+            FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
+            GetShellWindow, GetWindow, GetWindowPlacement, GetWindowRect, SetWindowPos,
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV, HWND_BOTTOM, HWND_TOPMOST,
+            MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWMAXIMIZED,
+            WINEVENT_OUTOFCONTEXT, WINDOWPLACEMENT,
         },
     },
 };
@@ -67,6 +76,7 @@ struct AppState {
     dock_hovered: Arc<AtomicBool>,
     hover_component_visible: Arc<AtomicBool>,
     hover_monitor_running: Arc<AtomicBool>,
+    dock_yielding_to_fullscreen: Arc<AtomicBool>,
     dock_pending_position: Arc<Mutex<Option<(i32, i32)>>>,
     latest_tray_usage: Arc<Mutex<Option<TrayUsageText>>>,
 }
@@ -1169,18 +1179,18 @@ fn show_dock_window(window: &WebviewWindow) {
 }
 
 #[cfg(target_os = "windows")]
-fn keep_dock_window_above_taskbar(window: &WebviewWindow) {
+fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
             let Ok(taskbar) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) else {
-                return;
+                return false;
             };
             let window_above_taskbar = GetWindow(taskbar, GW_HWNDPREV).ok();
             if window_above_taskbar == Some(hwnd) {
-                return;
+                return true;
             }
             let insert_after = window_above_taskbar.unwrap_or(HWND_TOPMOST);
-            let _ = SetWindowPos(
+            return SetWindowPos(
                 hwnd,
                 Some(insert_after),
                 0,
@@ -1188,14 +1198,125 @@ fn keep_dock_window_above_taskbar(window: &WebviewWindow) {
                 0,
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+            )
+            .is_ok();
         }
+    }
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
+    window.set_always_on_top(true).is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn dock_should_yield_to_fullscreen() -> bool {
+    let shell_reports_fullscreen = matches!(
+        unsafe { SHQueryUserNotificationState() },
+        Ok(state)
+            if state == QUNS_BUSY
+                || state == QUNS_RUNNING_D3D_FULL_SCREEN
+                || state == QUNS_PRESENTATION_MODE
+    );
+    shell_reports_fullscreen || foreground_window_covers_monitor()
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_window_covers_monitor() -> bool {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.0.is_null() {
+            return false;
+        }
+        if foreground == GetShellWindow()
+            || FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok() == Some(foreground)
+        {
+            return false;
+        }
+
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(foreground, &mut placement).is_err()
+            || placement.showCmd == SW_SHOWMAXIMIZED.0 as u32
+        {
+            return false;
+        }
+
+        let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+        if monitor.0.is_null() {
+            return false;
+        }
+
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+            return false;
+        }
+
+        let mut bounds = RECT::default();
+        if DwmGetWindowAttribute(
+            foreground,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut bounds as *mut RECT as *mut std::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        let monitor_bounds = monitor_info.rcMonitor;
+        const EDGE_TOLERANCE: i32 = 1;
+        bounds.left <= monitor_bounds.left + EDGE_TOLERANCE
+            && bounds.top <= monitor_bounds.top + EDGE_TOLERANCE
+            && bounds.right >= monitor_bounds.right - EDGE_TOLERANCE
+            && bounds.bottom >= monitor_bounds.bottom - EDGE_TOLERANCE
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn lower_dock_window(window: &WebviewWindow) -> bool {
+    let Ok(hwnd) = window.hwnd() else {
+        return false;
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_BOTTOM),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .is_ok()
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn keep_dock_window_above_taskbar(window: &WebviewWindow) {
-    let _ = window.set_always_on_top(true);
+fn dock_should_yield_to_fullscreen() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lower_dock_window(_: &WebviewWindow) -> bool {
+    false
+}
+
+fn update_dock_z_order(window: &WebviewWindow, state: &AppState) {
+    let is_yielding = state.dock_yielding_to_fullscreen.load(Ordering::Relaxed);
+    if dock_should_yield_to_fullscreen() {
+        if !is_yielding && lower_dock_window(window) {
+            state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
+        }
+    } else if keep_dock_window_above_taskbar(window) {
+        state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
+    }
 }
 
 fn refresh_dock_z_order(app: &AppHandle, state: &AppState) {
@@ -1206,11 +1327,7 @@ fn refresh_dock_z_order(app: &AppHandle, state: &AppState) {
         return;
     };
 
-    configure_dock_window_style(&window);
-    if !window.is_visible().unwrap_or(false) {
-        show_dock_window(&window);
-    }
-    keep_dock_window_above_taskbar(&window);
+    update_dock_z_order(&window, state);
 }
 
 #[cfg(target_os = "windows")]
@@ -1253,15 +1370,10 @@ fn start_dock_z_order_watcher(app: AppHandle, state: AppState) {
     let (tx, rx) = mpsc::channel::<()>();
     let _ = DOCK_Z_ORDER_EVENTS.set(tx);
 
-    let pulse_app = app.clone();
-    let pulse_state = state.clone();
     thread::spawn(move || {
         while rx.recv().is_ok() {
-            for _ in 0..24 {
-                refresh_dock_z_order(&pulse_app, &pulse_state);
-                thread::sleep(Duration::from_millis(16));
-            }
             while rx.try_recv().is_ok() {}
+            refresh_dock_z_order(&app, &state);
         }
     });
 
@@ -1387,9 +1499,10 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
         if !visible {
             show_dock_window(&window);
         }
-        keep_dock_window_above_taskbar(&window);
+        update_dock_z_order(&window, state);
     } else if visible {
         let _ = window.hide();
+        state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
     }
 }
 
@@ -2123,6 +2236,7 @@ pub fn run() {
         dock_hovered: Arc::new(AtomicBool::new(false)),
         hover_component_visible: Arc::new(AtomicBool::new(false)),
         hover_monitor_running: Arc::new(AtomicBool::new(false)),
+        dock_yielding_to_fullscreen: Arc::new(AtomicBool::new(false)),
         dock_pending_position: Arc::new(Mutex::new(None)),
         latest_tray_usage: Arc::new(Mutex::new(None)),
     };
@@ -2201,7 +2315,7 @@ pub fn run() {
                         if window_state.dock_enabled.load(Ordering::Relaxed) {
                             if let Some(dock) = app.get_webview_window("dock") {
                                 show_dock_window(&dock);
-                                keep_dock_window_above_taskbar(&dock);
+                                update_dock_z_order(&dock, &window_state);
                             }
                         } else {
                             let _ = window.hide();
