@@ -1103,6 +1103,12 @@ fn update_taskbar_display(app: &AppHandle, state: &AppState) {
     });
 }
 
+fn update_tray_visibility(app: &AppHandle, state: &AppState) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_visible(!state.dock_enabled.load(Ordering::Relaxed));
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn tray_notify_rect() -> Option<RECT> {
     unsafe {
@@ -1500,6 +1506,7 @@ fn move_dock_window(window: &WebviewWindow, position: tauri::PhysicalPosition<f6
 }
 
 fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
+    update_tray_visibility(app, state);
     let Some(window) = app.get_webview_window("dock") else {
         return;
     };
@@ -1793,6 +1800,7 @@ fn set_dock_enabled(app: AppHandle, enabled: bool) -> Result<AppSettings, String
     state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
     update_taskbar_display(&app, &state);
     update_dock_window(&app, &state, true);
+    refresh_tray_menu(&app);
     get_settings(app)
 }
 
@@ -1807,6 +1815,7 @@ fn set_taskbar_usage_enabled(app: AppHandle, enabled: bool) -> Result<AppSetting
     state.taskbar_usage_enabled.store(false, Ordering::Relaxed);
     update_taskbar_display(&app, &state);
     update_dock_window(&app, &state, true);
+    refresh_tray_menu(&app);
     get_settings(app)
 }
 
@@ -2121,6 +2130,14 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )
 }
 
+fn refresh_tray_menu(app: &AppHandle) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        if let Ok(menu) = build_app_menu(app) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
+
 fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
     match id {
         "visible" => {
@@ -2167,6 +2184,7 @@ fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
             let _ = write_stored_settings(app, &stored);
             update_taskbar_display(app, state);
             update_dock_window(app, state, true);
+            refresh_tray_menu(app);
         }
         "theme_orange" | "theme_green" => {
             let theme = if id == "theme_green" { "green" } else { "orange" };
@@ -2174,11 +2192,7 @@ fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
             stored.theme = theme.to_string();
             let _ = write_stored_settings(app, &stored);
             let _ = app.emit("theme-changed", theme);
-            if let Some(tray) = app.tray_by_id("main-tray") {
-                if let Ok(menu) = build_app_menu(app) {
-                    let _ = tray.set_menu(Some(menu));
-                }
-            }
+            refresh_tray_menu(app);
         }
         "startup" => {
             let enabled = app.autolaunch().is_enabled().unwrap_or(false);
@@ -2313,6 +2327,8 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+
+    update_tray_visibility(app, &state);
 
     Ok(())
 }
