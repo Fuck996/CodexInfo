@@ -190,7 +190,7 @@ button {
 }
 
 .dock-widget.is-single .dock-meter {
-  grid-template-columns: 88px 54px minmax(0, 1fr);
+  grid-template-columns: 80px 30px minmax(0, 1fr);
 }
 
 .dock-widget.is-single .dock-track {
