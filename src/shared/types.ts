@@ -1,11 +1,12 @@
-export type UsageWindowId = "fiveHour" | "sevenDay";
+export type ThemeName = "orange" | "green";
 
 export type UsageWindow = {
-  id: UsageWindowId;
+  id: string;
   label: string;
   used: number;
   total: number;
   resetAt: string;
+  windowDurationMins: number;
   displayMode?: "count" | "percent";
 };
 
@@ -62,6 +63,7 @@ export type AppSettings = {
   trayUsageEnabled: boolean;
   dockEnabled: boolean;
   taskbarUsageEnabled: boolean;
+  theme: ThemeName;
 };
 
 export type DesktopApi = {

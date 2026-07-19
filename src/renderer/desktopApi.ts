@@ -31,7 +31,8 @@ const unavailableApi: DesktopApi = {
     keepAlwaysOnTop: true,
     trayUsageEnabled: true,
     dockEnabled: true,
-    taskbarUsageEnabled: true
+    taskbarUsageEnabled: true,
+    theme: "orange"
   }),
   setLaunchAtStartup: async () => {
     throw new Error("Tauri 桥接不可用");

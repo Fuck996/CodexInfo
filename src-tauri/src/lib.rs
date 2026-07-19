@@ -23,7 +23,7 @@ use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     window::{ProgressBarState, ProgressBarStatus},
-    AppHandle, Manager, Runtime, WebviewWindow,
+    AppHandle, Emitter, Manager, Runtime, WebviewWindow,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
@@ -95,6 +95,8 @@ struct UsageWindow {
     used: f64,
     total: f64,
     reset_at: String,
+    #[serde(default)]
+    window_duration_mins: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     display_mode: Option<String>,
 }
@@ -168,6 +170,7 @@ struct AppSettings {
     tray_usage_enabled: bool,
     dock_enabled: bool,
     taskbar_usage_enabled: bool,
+    theme: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -179,6 +182,7 @@ struct StoredSettings {
     tray_usage_enabled: bool,
     dock_enabled: bool,
     taskbar_usage_enabled: bool,
+    theme: String,
 }
 
 impl Default for StoredSettings {
@@ -189,6 +193,7 @@ impl Default for StoredSettings {
             tray_usage_enabled: true,
             dock_enabled: true,
             taskbar_usage_enabled: false,
+            theme: "orange".to_string(),
         }
     }
 }
@@ -287,32 +292,50 @@ fn unix_seconds_to_iso(value: f64) -> String {
         .to_rfc3339()
 }
 
-fn app_server_window_to_usage(id: &str, label: &str, value: Option<&Value>) -> Option<UsageWindow> {
+fn usage_window_label(window_duration_mins: u64) -> String {
+    match window_duration_mins {
+        10_080 => "\u{6bcf}\u{5468}\u{7528}\u{91cf}".to_string(),
+        1_440 => "\u{6bcf}\u{65e5}\u{7528}\u{91cf}".to_string(),
+        minutes if minutes > 0 && minutes % 1_440 == 0 => {
+            format!("{} \u{5929}\u{7528}\u{91cf}", minutes / 1_440)
+        }
+        minutes if minutes > 0 && minutes % 60 == 0 => {
+            format!("{} \u{5c0f}\u{65f6}\u{7528}\u{91cf}", minutes / 60)
+        }
+        _ => "\u{7528}\u{91cf}".to_string(),
+    }
+}
+
+fn app_server_window_to_usage(slot: &str, value: Option<&Value>) -> Option<UsageWindow> {
     let window = value?;
     let used_percent = number(window.get("usedPercent")?)?;
     let resets_at = number(window.get("resetsAt")?)?;
+    let window_duration_mins = number(window.get("windowDurationMins")?)? as u64;
 
     Some(UsageWindow {
-        id: id.to_string(),
-        label: label.to_string(),
+        id: format!("codex-{slot}-{window_duration_mins}"),
+        label: usage_window_label(window_duration_mins),
         used: used_percent.clamp(0.0, 100.0),
         total: 100.0,
         reset_at: unix_seconds_to_iso(resets_at),
+        window_duration_mins,
         display_mode: Some("percent".to_string()),
     })
 }
 
-fn session_window_to_usage(id: &str, label: &str, value: Option<&Value>) -> Option<UsageWindow> {
+fn session_window_to_usage(slot: &str, value: Option<&Value>) -> Option<UsageWindow> {
     let window = value?;
     let used_percent = number(window.get("used_percent")?)?;
     let resets_at = number(window.get("resets_at")?)?;
+    let window_duration_mins = number(window.get("window_minutes")?)? as u64;
 
     Some(UsageWindow {
-        id: id.to_string(),
-        label: label.to_string(),
+        id: format!("codex-{slot}-{window_duration_mins}"),
+        label: usage_window_label(window_duration_mins),
         used: used_percent.clamp(0.0, 100.0),
         total: 100.0,
         reset_at: unix_seconds_to_iso(resets_at),
+        window_duration_mins,
         display_mode: Some("percent".to_string()),
     })
 }
@@ -472,10 +495,10 @@ fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, S
         .get("rate_limits")
         .ok_or_else(|| format!("Codex 会话日志缺少 rate_limits: {}", event.source_path.display()))?;
     let mut windows = Vec::new();
-    if let Some(window) = session_window_to_usage("fiveHour", "5 小时用量", rate_limits.get("primary")) {
+    if let Some(window) = session_window_to_usage("primary", rate_limits.get("primary")) {
         windows.push(window);
     }
-    if let Some(window) = session_window_to_usage("sevenDay", "7 天用量", rate_limits.get("secondary")) {
+    if let Some(window) = session_window_to_usage("secondary", rate_limits.get("secondary")) {
         windows.push(window);
     }
     if windows.is_empty() {
@@ -1006,24 +1029,40 @@ fn reset_duration(value: &str) -> String {
 }
 
 fn build_tray_usage_text(snapshot: &UsageSnapshot) -> Option<TrayUsageText> {
-    let five_hour = snapshot.windows.iter().find(|window| window.id == "fiveHour")?;
-    let weekly = snapshot.windows.iter().find(|window| window.id == "sevenDay")?;
-    let five_hour_percent = remaining_percent(five_hour);
-    let weekly_percent = remaining_percent(weekly);
-    let title = format!(
-        "5小时 {five_hour_percent}% · {}\n每周 {weekly_percent}% · {}",
-        reset_clock(&five_hour.reset_at),
-        reset_days(&weekly.reset_at)
-    );
-    let tooltip = format!(
-        "CodexInfo · {}\n5小时 {five_hour_percent}% 剩余 · 重置 {}\n每周 {weekly_percent}% 剩余 · {}后重置",
-        plan_label(&snapshot.plan_name),
-        reset_duration(&five_hour.reset_at),
-        reset_days(&weekly.reset_at)
-    );
+    if snapshot.windows.is_empty() {
+        return None;
+    }
+
+    let title = snapshot
+        .windows
+        .iter()
+        .map(|window| {
+            let label = window.label.trim_end_matches("\u{7528}\u{91cf}");
+            let reset = if window.window_duration_mins >= 1_440 {
+                reset_days(&window.reset_at)
+            } else {
+                reset_clock(&window.reset_at)
+            };
+            format!("{label} {}% \u{00b7} {reset}", remaining_percent(window))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let details = snapshot
+        .windows
+        .iter()
+        .map(|window| {
+            format!(
+                "{} {}% \u{5269}\u{4f59} \u{00b7} \u{91cd}\u{7f6e} {}",
+                window.label,
+                remaining_percent(window),
+                reset_duration(&window.reset_at)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     Some(TrayUsageText {
         title,
-        tooltip,
+        tooltip: format!("CodexInfo \u{00b7} {}\n{details}", plan_label(&snapshot.plan_name)),
     })
 }
 
@@ -1539,10 +1578,10 @@ fn snapshot_from_app_server(app_server: Value, session_token: Option<TokenUsage>
     let bucket = pick_codex_bucket(rate_limits)?;
     let mut windows = Vec::new();
 
-    if let Some(window) = app_server_window_to_usage("fiveHour", "5 小时用量", bucket.get("primary")) {
+    if let Some(window) = app_server_window_to_usage("primary", bucket.get("primary")) {
         windows.push(window);
     }
-    if let Some(window) = app_server_window_to_usage("sevenDay", "7 天用量", bucket.get("secondary")) {
+    if let Some(window) = app_server_window_to_usage("secondary", bucket.get("secondary")) {
         windows.push(window);
     }
     if windows.is_empty() {
@@ -1714,6 +1753,11 @@ fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
         tray_usage_enabled: stored.tray_usage_enabled,
         dock_enabled,
         taskbar_usage_enabled: dock_enabled,
+        theme: if stored.theme == "green" {
+            "green".to_string()
+        } else {
+            "orange".to_string()
+        },
     })
 }
 
@@ -2044,6 +2088,22 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         None::<&str>,
     )?;
     let startup_checked = app.autolaunch().is_enabled().unwrap_or(false);
+    let orange_theme_item = CheckMenuItem::with_id(
+        app,
+        "theme_orange",
+        "\u{4e3b}\u{9898}\u{ff1a}\u{6a59}\u{8272}",
+        true,
+        stored_settings.theme != "green",
+        None::<&str>,
+    )?;
+    let green_theme_item = CheckMenuItem::with_id(
+        app,
+        "theme_green",
+        "\u{4e3b}\u{9898}\u{ff1a}\u{7eff}\u{8272}",
+        true,
+        stored_settings.theme == "green",
+        None::<&str>,
+    )?;
     let startup_item = CheckMenuItem::with_id(app, "startup", "开机启动", true, startup_checked, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Menu::with_items(
@@ -2053,6 +2113,8 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &top_item,
             &tray_usage_item,
             &taskbar_usage_item,
+            &orange_theme_item,
+            &green_theme_item,
             &startup_item,
             &quit_item,
         ],
@@ -2105,6 +2167,18 @@ fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
             let _ = write_stored_settings(app, &stored);
             update_taskbar_display(app, state);
             update_dock_window(app, state, true);
+        }
+        "theme_orange" | "theme_green" => {
+            let theme = if id == "theme_green" { "green" } else { "orange" };
+            let mut stored = read_stored_settings(app).unwrap_or_default();
+            stored.theme = theme.to_string();
+            let _ = write_stored_settings(app, &stored);
+            let _ = app.emit("theme-changed", theme);
+            if let Some(tray) = app.tray_by_id("main-tray") {
+                if let Ok(menu) = build_app_menu(app) {
+                    let _ = tray.set_menu(Some(menu));
+                }
+            }
         }
         "startup" => {
             let enabled = app.autolaunch().is_enabled().unwrap_or(false);
@@ -2179,6 +2253,22 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let startup_checked = app.autolaunch().is_enabled().unwrap_or(false);
+    let orange_theme_item = CheckMenuItem::with_id(
+        app,
+        "theme_orange",
+        "\u{4e3b}\u{9898}\u{ff1a}\u{6a59}\u{8272}",
+        true,
+        stored_settings.theme != "green",
+        None::<&str>,
+    )?;
+    let green_theme_item = CheckMenuItem::with_id(
+        app,
+        "theme_green",
+        "\u{4e3b}\u{9898}\u{ff1a}\u{7eff}\u{8272}",
+        true,
+        stored_settings.theme == "green",
+        None::<&str>,
+    )?;
     let startup_item =
         CheckMenuItem::with_id(app, "startup", "开机启动", true, startup_checked, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -2189,6 +2279,8 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
             &top_item,
             &tray_usage_item,
             &taskbar_usage_item,
+            &orange_theme_item,
+            &green_theme_item,
             &startup_item,
             &quit_item,
         ],

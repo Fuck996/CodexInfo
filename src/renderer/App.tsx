@@ -1,7 +1,8 @@
 ﻿import { ChevronDown, ChevronUp, Database } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { TokenPeriodId, TokenPeriodUsage, TokenUsage, UsageSnapshot, UsageWindow } from "../shared/types";
+import type { ThemeName, TokenPeriodId, TokenPeriodUsage, TokenUsage, UsageSnapshot, UsageWindow } from "../shared/types";
 import { desktopApi } from "./desktopApi";
 import dockIcon from "./assets/dock-icon.png";
 
@@ -224,12 +225,7 @@ function compactPlanName(value: string | null | undefined) {
 }
 
 function sortWindows(windows: UsageWindow[]) {
-  const order = new Map<UsageWindow["id"], number>([
-    ["fiveHour", 0],
-    ["sevenDay", 1]
-  ]);
-
-  return [...windows].sort((a, b) => (order.get(a.id) ?? 99) - (order.get(b.id) ?? 99));
+  return [...windows].sort((a, b) => a.windowDurationMins - b.windowDurationMins);
 }
 
 const currentWindowLabel = window.__TAURI_INTERNALS__ ? getCurrentWindow().label : "main";
@@ -242,6 +238,35 @@ export function App() {
   const [codexConnected, setCodexConnected] = useState(false);
   const [error, setError] = useState("");
   const snapshotRef = useRef<UsageSnapshot | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+
+    function applyTheme(theme: ThemeName) {
+      document.documentElement.dataset.theme = theme;
+    }
+
+    void desktopApi.getSettings().then((settings) => {
+      if (!disposed) {
+        applyTheme(settings.theme);
+      }
+    });
+    if (window.__TAURI_INTERNALS__) {
+      void listen<ThemeName>("theme-changed", (event) => applyTheme(event.payload)).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          stopListening = unlisten;
+        }
+      });
+    }
+
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -348,8 +373,11 @@ export function App() {
       <section className={canExpand ? "widget has-reset-details" : "widget"} aria-label="Codex 用量组件">
         <div className="chrome drag-region" data-tauri-drag-region>
           <div className="brand">
-            <span className={`status-dot ${statusClass}`} title={statusTitle} />
-            <span>CODEX 用量核心</span>
+            <span className="brand-icon-wrap" title={statusTitle}>
+              <img className="brand-icon" src={dockIcon} alt="" />
+              <span className={`status-dot ${statusClass}`} />
+            </span>
+            <strong className="brand-title"><span>CODEX</span><em>用量核心</em></strong>
           </div>
           <div className="plan-meta">
             <span className="plan-badge">{compactPlanName(snapshot?.planName)}</span>
@@ -358,7 +386,7 @@ export function App() {
 
         {snapshot ? (
           <>
-            <div className="quota-grid">
+            <div className={windows.length === 1 ? "quota-grid is-single" : "quota-grid"}>
               {windows.map((window) => (
                 <UsageCard key={window.id} window={window} />
               ))}
@@ -398,8 +426,7 @@ function DockBar({
   snapshot: UsageSnapshot | null;
   windows: UsageWindow[];
 }) {
-  const fiveHour = windows.find((window) => window.id === "fiveHour");
-  const sevenDay = windows.find((window) => window.id === "sevenDay");
+  const singleWindow = windows.length === 1;
   return (
     <main
       className="dock-shell"
@@ -414,11 +441,12 @@ function DockBar({
         event.stopPropagation();
       }}
     >
-      <section className="dock-widget" aria-label="Codex 用量悬浮条">
+      <section className={singleWindow ? "dock-widget is-single" : "dock-widget"} aria-label="Codex 用量悬浮条">
         <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={dockIcon} alt="" />
-        <div className="dock-meters">
-          <DockMeter window={fiveHour} label="5 小时" resetText={fiveHour ? formatClock(fiveHour.resetAt) : "--"} />
-          <DockMeter window={sevenDay} label="每周" resetText={sevenDay ? formatResetDistance(sevenDay.resetAt) : "--"} />
+        <div className={singleWindow ? "dock-meters is-single" : "dock-meters"}>
+          {windows.map((usageWindow) => (
+            <DockMeter key={usageWindow.id} window={usageWindow} />
+          ))}
         </div>
       </section>
     </main>
@@ -426,15 +454,15 @@ function DockBar({
 }
 
 function DockMeter({
-  window,
-  label,
-  resetText
+  window
 }: {
-  window: UsageWindow | undefined;
-  label: string;
-  resetText: string;
+  window: UsageWindow;
 }) {
-  const remainingPercent = window ? Math.round(ratio(remainingOf(window), window.total)) : 0;
+  const remainingPercent = Math.round(ratio(remainingOf(window), window.total));
+  const label = window.label.replace(/用量$/, "");
+  const resetText = window.windowDurationMins >= 1440
+    ? formatResetDistance(window.resetAt)
+    : formatClock(window.resetAt);
 
   return (
     <div className="dock-meter">
@@ -443,7 +471,7 @@ function DockMeter({
       </div>
       <strong>{label}</strong>
       <span>
-        {window ? `${remainingPercent}% · ${resetText}` : "--"}
+        {remainingPercent}% · {resetText}
       </span>
     </div>
   );
