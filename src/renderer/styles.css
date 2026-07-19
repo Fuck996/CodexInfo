@@ -190,11 +190,17 @@ button {
 }
 
 .dock-widget.is-single .dock-meter {
-  grid-template-columns: 80px 30px minmax(0, 1fr);
+  grid-template-columns: 80px 30px 30px minmax(0, 1fr);
+  gap: 4px;
 }
 
 .dock-widget.is-single .dock-track {
   height: 10px;
+}
+
+.dock-percent {
+  color: var(--text);
+  font-weight: 700;
 }
 
 .chrome,

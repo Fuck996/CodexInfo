@@ -445,7 +445,7 @@ function DockBar({
         <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={dockIcon} alt="" />
         <div className={singleWindow ? "dock-meters is-single" : "dock-meters"}>
           {windows.map((usageWindow) => (
-            <DockMeter key={usageWindow.id} window={usageWindow} />
+            <DockMeter key={usageWindow.id} single={singleWindow} window={usageWindow} />
           ))}
         </div>
       </section>
@@ -454,8 +454,10 @@ function DockBar({
 }
 
 function DockMeter({
+  single,
   window
 }: {
+  single: boolean;
   window: UsageWindow;
 }) {
   const remainingPercent = Math.round(ratio(remainingOf(window), window.total));
@@ -469,10 +471,9 @@ function DockMeter({
       <div className="dock-track">
         <span style={{ width: `${remainingPercent}%` }} />
       </div>
+      {single && <span className="dock-percent">{remainingPercent}%</span>}
       <strong>{label}</strong>
-      <span>
-        {remainingPercent}% · {resetText}
-      </span>
+      <span className="dock-reset">{single ? `· ${resetText}` : `${remainingPercent}% · ${resetText}`}</span>
     </div>
   );
 }
