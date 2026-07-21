@@ -38,15 +38,11 @@ use windows::{
             Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
         },
         UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
-        UI::Shell::{
-            SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE,
-            QUNS_RUNNING_D3D_FULL_SCREEN,
-        },
         UI::WindowsAndMessaging::{
             FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
-            GetShellWindow, GetWindow, GetWindowPlacement, GetWindowRect, SetWindowPos,
-            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV, HWND_BOTTOM, HWND_TOPMOST,
-            MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWMAXIMIZED,
+            GetShellWindow, GetWindowPlacement, GetWindowRect, SetWindowPos,
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, HWND_BOTTOM, HWND_TOPMOST, MSG,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWMAXIMIZED,
             WINEVENT_OUTOFCONTEXT, WINDOWPLACEMENT,
         },
     },
@@ -1227,17 +1223,9 @@ fn show_dock_window(window: &WebviewWindow) {
 fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
-            let Ok(taskbar) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) else {
-                return false;
-            };
-            let window_above_taskbar = GetWindow(taskbar, GW_HWNDPREV).ok();
-            if window_above_taskbar == Some(hwnd) {
-                return true;
-            }
-            let insert_after = window_above_taskbar.unwrap_or(HWND_TOPMOST);
             return SetWindowPos(
                 hwnd,
-                Some(insert_after),
+                Some(HWND_TOPMOST),
                 0,
                 0,
                 0,
@@ -1257,14 +1245,7 @@ fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
 
 #[cfg(target_os = "windows")]
 fn dock_should_yield_to_fullscreen() -> bool {
-    let shell_reports_fullscreen = matches!(
-        unsafe { SHQueryUserNotificationState() },
-        Ok(state)
-            if state == QUNS_BUSY
-                || state == QUNS_RUNNING_D3D_FULL_SCREEN
-                || state == QUNS_PRESENTATION_MODE
-    );
-    shell_reports_fullscreen || foreground_window_covers_monitor()
+    foreground_window_covers_monitor()
 }
 
 #[cfg(target_os = "windows")]
