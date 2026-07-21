@@ -40,10 +40,9 @@ use windows::{
         UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
         UI::WindowsAndMessaging::{
             FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
-            GetShellWindow, GetWindowPlacement, GetWindowRect, SetWindowPos,
+            GetShellWindow, GetWindowRect, IsWindowVisible, SetWindowPos,
             EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, HWND_BOTTOM, HWND_TOPMOST, MSG,
-            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWMAXIMIZED,
-            WINEVENT_OUTOFCONTEXT, WINDOWPLACEMENT,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT,
         },
     },
 };
@@ -1244,15 +1243,18 @@ fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn dock_should_yield_to_fullscreen() -> bool {
-    foreground_window_covers_monitor()
+fn dock_should_yield_to_fullscreen(window: &WebviewWindow) -> bool {
+    foreground_window_covers_dock_monitor(window)
 }
 
 #[cfg(target_os = "windows")]
-fn foreground_window_covers_monitor() -> bool {
+fn foreground_window_covers_dock_monitor(window: &WebviewWindow) -> bool {
     unsafe {
+        let Ok(dock) = window.hwnd() else {
+            return false;
+        };
         let foreground = GetForegroundWindow();
-        if foreground.0.is_null() {
+        if foreground.0.is_null() || foreground == dock || !IsWindowVisible(foreground).as_bool() {
             return false;
         }
         if foreground == GetShellWindow()
@@ -1261,18 +1263,12 @@ fn foreground_window_covers_monitor() -> bool {
             return false;
         }
 
-        let mut placement = WINDOWPLACEMENT {
-            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-            ..Default::default()
-        };
-        if GetWindowPlacement(foreground, &mut placement).is_err()
-            || placement.showCmd == SW_SHOWMAXIMIZED.0 as u32
+        let foreground_monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+        let dock_monitor = MonitorFromWindow(dock, MONITOR_DEFAULTTONEAREST);
+        if foreground_monitor.0.is_null()
+            || dock_monitor.0.is_null()
+            || foreground_monitor != dock_monitor
         {
-            return false;
-        }
-
-        let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
-        if monitor.0.is_null() {
             return false;
         }
 
@@ -1280,7 +1276,7 @@ fn foreground_window_covers_monitor() -> bool {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+        if !GetMonitorInfoW(foreground_monitor, &mut monitor_info).as_bool() {
             return false;
         }
 
@@ -1296,12 +1292,40 @@ fn foreground_window_covers_monitor() -> bool {
             return false;
         }
 
-        let monitor_bounds = monitor_info.rcMonitor;
-        const EDGE_TOLERANCE: i32 = 1;
-        bounds.left <= monitor_bounds.left + EDGE_TOLERANCE
-            && bounds.top <= monitor_bounds.top + EDGE_TOLERANCE
-            && bounds.right >= monitor_bounds.right - EDGE_TOLERANCE
-            && bounds.bottom >= monitor_bounds.bottom - EDGE_TOLERANCE
+        rect_covers_monitor(bounds, monitor_info.rcMonitor)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn rect_covers_monitor(bounds: RECT, monitor: RECT) -> bool {
+    const EDGE_TOLERANCE: i32 = 1;
+    bounds.left <= monitor.left + EDGE_TOLERANCE
+        && bounds.top <= monitor.top + EDGE_TOLERANCE
+        && bounds.right >= monitor.right - EDGE_TOLERANCE
+        && bounds.bottom >= monitor.bottom - EDGE_TOLERANCE
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod dock_z_order_tests {
+    use super::*;
+
+    #[test]
+    fn detects_full_monitor_bounds_only() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let maximized_work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1392,
+        };
+
+        assert!(rect_covers_monitor(monitor, monitor));
+        assert!(!rect_covers_monitor(maximized_work_area, monitor));
     }
 }
 
@@ -1325,7 +1349,7 @@ fn lower_dock_window(window: &WebviewWindow) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn dock_should_yield_to_fullscreen() -> bool {
+fn dock_should_yield_to_fullscreen(_: &WebviewWindow) -> bool {
     false
 }
 
@@ -1336,7 +1360,8 @@ fn lower_dock_window(_: &WebviewWindow) -> bool {
 
 fn update_dock_z_order(window: &WebviewWindow, state: &AppState) {
     let is_yielding = state.dock_yielding_to_fullscreen.load(Ordering::Relaxed);
-    if dock_should_yield_to_fullscreen() {
+    let should_yield = dock_should_yield_to_fullscreen(window);
+    if should_yield {
         if !is_yielding && lower_dock_window(window) {
             state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
         }
