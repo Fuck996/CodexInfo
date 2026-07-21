@@ -2400,17 +2400,29 @@ pub fn run() {
                 let startup_state = state.clone();
                 thread::spawn(move || {
                     thread::sleep(Duration::from_millis(300));
-                    update_dock_window(&startup_app, &startup_state, true);
-                    if let Some(window) = startup_app.get_webview_window("main") {
-                        show_window(&window);
-                    }
+                    let callback_app = startup_app.clone();
+                    let _ = startup_app.run_on_main_thread(move || {
+                        update_dock_window(&callback_app, &startup_state, true);
+                        if let Some(window) = callback_app.get_webview_window("main") {
+                            show_window(&window);
+                        }
+                    });
                 });
             }
             let dock_app = app.handle().clone();
             let dock_state = state.clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_millis(750));
-                update_dock_window(&dock_app, &dock_state, false);
+                let callback_app = dock_app.clone();
+                let callback_state = dock_state.clone();
+                if dock_app
+                    .run_on_main_thread(move || {
+                        update_dock_window(&callback_app, &callback_state, false);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             });
             start_dock_z_order_watcher(app.handle().clone(), state.clone());
             Ok(())
