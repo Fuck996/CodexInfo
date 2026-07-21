@@ -1521,7 +1521,6 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
     let visible = window.is_visible().unwrap_or(false);
 
     if enabled {
-        configure_dock_window_style(&window);
         let scale_factor = app
             .primary_monitor()
             .ok()
