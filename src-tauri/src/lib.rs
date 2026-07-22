@@ -33,10 +33,15 @@ use windows::{
     core::{w, PCWSTR},
     Win32::{
         Foundation::{HWND, RECT},
+        Graphics::{
+            Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS},
+            Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+        },
         UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetWindow, GetWindowRect,
-            SetWindowPos, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV,
+            FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
+            GetShellWindow, GetWindow, GetWindowRect, IsWindow, IsWindowVisible, SetWindowPos,
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV, HWND_BOTTOM,
             HWND_TOPMOST, MSG,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT,
         },
@@ -67,6 +72,7 @@ struct AppState {
     dock_hovered: Arc<AtomicBool>,
     hover_component_visible: Arc<AtomicBool>,
     hover_monitor_running: Arc<AtomicBool>,
+    dock_yielding_to_fullscreen: Arc<AtomicBool>,
     dock_pending_position: Arc<Mutex<Option<(i32, i32)>>>,
     latest_tray_usage: Arc<Mutex<Option<TrayUsageText>>>,
 }
@@ -1215,35 +1221,21 @@ fn show_dock_window(window: &WebviewWindow) {
 
 #[cfg(target_os = "windows")]
 fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
+    if window.set_always_on_top(true).is_err() {
+        return false;
+    }
     let Ok(hwnd) = window.hwnd() else {
         return false;
     };
+    keep_dock_hwnd_above_taskbar(hwnd)
+}
+
+#[cfg(target_os = "windows")]
+fn keep_dock_hwnd_above_taskbar(hwnd: HWND) -> bool {
     unsafe {
-        let Ok(taskbar) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) else {
-            return false;
-        };
-        let Ok(window_above_taskbar) = GetWindow(taskbar, GW_HWNDPREV) else {
-            return false;
-        };
-        if window_above_taskbar == hwnd {
-            return true;
-        }
-        if SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-        .is_err()
-        {
-            return false;
-        }
         SetWindowPos(
             hwnd,
-            Some(window_above_taskbar),
+            Some(HWND_TOPMOST),
             0,
             0,
             0,
@@ -1259,8 +1251,187 @@ fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
     window.set_always_on_top(true).is_ok()
 }
 
-fn update_dock_z_order(window: &WebviewWindow, _: &AppState) {
-    let _ = keep_dock_window_above_taskbar(window);
+#[cfg(target_os = "windows")]
+fn dock_is_above_taskbar(window: &WebviewWindow) -> bool {
+    let Ok(hwnd) = window.hwnd() else {
+        return false;
+    };
+    dock_hwnd_is_above_taskbar(hwnd)
+}
+
+#[cfg(target_os = "windows")]
+fn dock_hwnd_is_above_taskbar(hwnd: HWND) -> bool {
+    unsafe {
+        let Ok(taskbar) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) else {
+            return false;
+        };
+        let mut current = taskbar;
+        while let Ok(previous) = GetWindow(current, GW_HWNDPREV) {
+            if previous == hwnd {
+                return true;
+            }
+            current = previous;
+        }
+        false
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dock_is_above_taskbar(_: &WebviewWindow) -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_window_covers_dock_monitor(window: &WebviewWindow) -> bool {
+    let Ok(dock) = window.hwnd() else {
+        return false;
+    };
+    foreground_window_covers_monitor(dock)
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_window_covers_monitor(dock: HWND) -> bool {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.0.is_null() || foreground == dock || !IsWindowVisible(foreground).as_bool() {
+            return false;
+        }
+        if foreground == GetShellWindow()
+            || FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok() == Some(foreground)
+        {
+            return false;
+        }
+
+        let foreground_monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+        let dock_monitor = MonitorFromWindow(dock, MONITOR_DEFAULTTONEAREST);
+        if foreground_monitor.0.is_null()
+            || dock_monitor.0.is_null()
+            || foreground_monitor != dock_monitor
+        {
+            return false;
+        }
+
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(foreground_monitor, &mut monitor_info).as_bool() {
+            return false;
+        }
+
+        let mut bounds = RECT::default();
+        if DwmGetWindowAttribute(
+            foreground,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut bounds as *mut RECT as *mut std::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        rect_covers_monitor(bounds, monitor_info.rcMonitor)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn rect_covers_monitor(bounds: RECT, monitor: RECT) -> bool {
+    const EDGE_TOLERANCE: i32 = 1;
+    bounds.left <= monitor.left + EDGE_TOLERANCE
+        && bounds.top <= monitor.top + EDGE_TOLERANCE
+        && bounds.right >= monitor.right - EDGE_TOLERANCE
+        && bounds.bottom >= monitor.bottom - EDGE_TOLERANCE
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod dock_z_order_tests {
+    use super::*;
+
+    #[test]
+    fn only_full_monitor_bounds_count_as_fullscreen() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let maximized_work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1392,
+        };
+
+        assert!(rect_covers_monitor(monitor, monitor));
+        assert!(!rect_covers_monitor(maximized_work_area, monitor));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn lower_dock_window(window: &WebviewWindow) -> bool {
+    let Ok(hwnd) = window.hwnd() else {
+        return false;
+    };
+    lower_dock_hwnd(hwnd)
+}
+
+#[cfg(target_os = "windows")]
+fn lower_dock_hwnd(hwnd: HWND) -> bool {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_BOTTOM),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .is_ok()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn foreground_window_covers_dock_monitor(_: &WebviewWindow) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lower_dock_window(_: &WebviewWindow) -> bool {
+    false
+}
+
+fn update_dock_z_order(window: &WebviewWindow, state: &AppState) {
+    let is_yielding = state.dock_yielding_to_fullscreen.load(Ordering::Relaxed);
+    if foreground_window_covers_dock_monitor(window) {
+        if !is_yielding && lower_dock_window(window) {
+            state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
+        }
+    } else if (is_yielding || !dock_is_above_taskbar(window))
+        && keep_dock_window_above_taskbar(window)
+    {
+        state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn update_dock_hwnd_z_order(hwnd: HWND, state: &AppState) {
+    if !state.dock_enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    let is_yielding = state.dock_yielding_to_fullscreen.load(Ordering::Relaxed);
+    let fullscreen = foreground_window_covers_monitor(hwnd);
+    let above_taskbar = dock_hwnd_is_above_taskbar(hwnd);
+    if fullscreen {
+        if !is_yielding && lower_dock_hwnd(hwnd) {
+            state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
+        }
+    } else if (is_yielding || !above_taskbar)
+        && keep_dock_hwnd_above_taskbar(hwnd)
+    {
+        state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
+    }
 }
 
 fn refresh_dock_z_order(app: &AppHandle, state: &AppState) {
@@ -1319,14 +1490,10 @@ fn start_dock_z_order_watcher(app: AppHandle, state: AppState) {
             while rx.try_recv().is_ok() {}
             let callback_app = app.clone();
             let callback_state = state.clone();
-            if app
+            let _ = app
                 .run_on_main_thread(move || {
                     refresh_dock_z_order(&callback_app, &callback_state);
-                })
-                .is_err()
-            {
-                break;
-            }
+                });
         }
     });
 
@@ -1351,6 +1518,38 @@ fn start_dock_z_order_watcher(app: AppHandle, state: AppState) {
 
 #[cfg(not(target_os = "windows"))]
 fn start_dock_z_order_watcher(_: AppHandle, _: AppState) {}
+
+#[cfg(target_os = "windows")]
+fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
+    let Some(window) = app.get_webview_window("dock") else {
+        return;
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let hwnd_value = hwnd.0 as usize;
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(750));
+        let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+        if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            break;
+        }
+        update_dock_hwnd_z_order(hwnd, &state);
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
+    let app = app.clone();
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(750));
+        let callback_app = app.clone();
+        let callback_state = state.clone();
+        let _ = app.run_on_main_thread(move || {
+            refresh_dock_z_order(&callback_app, &callback_state);
+        });
+    });
+}
 
 #[cfg(target_os = "windows")]
 fn dock_is_clear_of_tray(window: &WebviewWindow, scale_factor: f64) -> bool {
@@ -1455,6 +1654,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
         update_dock_z_order(&window, state);
     } else if visible {
         let _ = window.hide();
+        state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
     }
 }
 
@@ -2250,6 +2450,7 @@ pub fn run() {
         dock_hovered: Arc::new(AtomicBool::new(false)),
         hover_component_visible: Arc::new(AtomicBool::new(false)),
         hover_monitor_running: Arc::new(AtomicBool::new(false)),
+        dock_yielding_to_fullscreen: Arc::new(AtomicBool::new(false)),
         dock_pending_position: Arc::new(Mutex::new(None)),
         latest_tray_usage: Arc::new(Mutex::new(None)),
     };
@@ -2309,21 +2510,7 @@ pub fn run() {
                     });
                 });
             }
-            let dock_app = app.handle().clone();
-            let dock_state = state.clone();
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_millis(750));
-                let callback_app = dock_app.clone();
-                let callback_state = dock_state.clone();
-                if dock_app
-                    .run_on_main_thread(move || {
-                        update_dock_window(&callback_app, &callback_state, false);
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            });
+            start_dock_z_order_maintenance(app.handle(), state.clone());
             start_dock_z_order_watcher(app.handle().clone(), state.clone());
             Ok(())
         })
