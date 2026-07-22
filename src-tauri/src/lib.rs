@@ -1524,15 +1524,13 @@ fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
     let Some(window) = app.get_webview_window("dock") else {
         return;
     };
-    let Ok(hwnd) = window.hwnd() else {
-        return;
-    };
-    let hwnd_value = hwnd.0 as usize;
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(750));
-        let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+        let Ok(hwnd) = window.hwnd() else {
+            continue;
+        };
         if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
-            break;
+            continue;
         }
         update_dock_hwnd_z_order(hwnd, &state);
     });
