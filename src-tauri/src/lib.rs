@@ -40,7 +40,7 @@ use windows::{
         UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
         UI::WindowsAndMessaging::{
             FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
-            GetShellWindow, GetWindow, GetWindowRect, IsWindow, IsWindowVisible, SetWindowPos,
+            GetShellWindow, GetWindow, GetWindowRect, IsWindowVisible, SetWindowPos,
             EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV, HWND_BOTTOM,
             HWND_TOPMOST, MSG,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT,
@@ -1434,6 +1434,12 @@ fn update_dock_hwnd_z_order(hwnd: HWND, state: &AppState) {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn find_current_dock_hwnd() -> Option<HWND> {
+    unsafe { FindWindowW(PCWSTR::null(), w!("Codex Usage Dock")).ok() }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn refresh_dock_z_order(app: &AppHandle, state: &AppState) {
     if !state.dock_enabled.load(Ordering::Relaxed) {
         return;
@@ -1481,19 +1487,16 @@ unsafe extern "system" fn dock_z_order_event_proc(
 }
 
 #[cfg(target_os = "windows")]
-fn start_dock_z_order_watcher(app: AppHandle, state: AppState) {
+fn start_dock_z_order_watcher(_: AppHandle, state: AppState) {
     let (tx, rx) = mpsc::channel::<()>();
     let _ = DOCK_Z_ORDER_EVENTS.set(tx);
 
     thread::spawn(move || {
         while rx.recv().is_ok() {
             while rx.try_recv().is_ok() {}
-            let callback_app = app.clone();
-            let callback_state = state.clone();
-            let _ = app
-                .run_on_main_thread(move || {
-                    refresh_dock_z_order(&callback_app, &callback_state);
-                });
+            if let Some(hwnd) = find_current_dock_hwnd() {
+                update_dock_hwnd_z_order(hwnd, &state);
+            }
         }
     });
 
@@ -1520,19 +1523,12 @@ fn start_dock_z_order_watcher(app: AppHandle, state: AppState) {
 fn start_dock_z_order_watcher(_: AppHandle, _: AppState) {}
 
 #[cfg(target_os = "windows")]
-fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
-    let Some(window) = app.get_webview_window("dock") else {
-        return;
-    };
+fn start_dock_z_order_maintenance(_: &AppHandle, state: AppState) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(750));
-        let Ok(hwnd) = window.hwnd() else {
-            continue;
-        };
-        if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
-            continue;
+        if let Some(hwnd) = find_current_dock_hwnd() {
+            update_dock_hwnd_z_order(hwnd, &state);
         }
-        update_dock_hwnd_z_order(hwnd, &state);
     });
 }
 
