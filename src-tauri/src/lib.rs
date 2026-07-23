@@ -34,15 +34,15 @@ use windows::{
     Win32::{
         Foundation::{HWND, RECT},
         Graphics::{
-            Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS},
+            Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
             Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
         },
         UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
-            GetShellWindow, GetWindow, GetWindowRect, IsWindowVisible, SetWindowPos,
-            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV, HWND_BOTTOM,
-            HWND_NOTOPMOST, HWND_TOPMOST, MSG,
+            FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetShellWindow, GetTopWindow,
+            GetWindow, GetWindowRect, IsIconic, IsWindowVisible, SetWindowPos,
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDNEXT, GW_HWNDPREV,
+            HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, MSG,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT,
         },
     },
@@ -1295,56 +1295,75 @@ fn dock_is_above_taskbar(_: &WebviewWindow) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn foreground_window_covers_dock_monitor(window: &WebviewWindow) -> bool {
+fn dock_monitor_has_fullscreen_window(window: &WebviewWindow) -> bool {
     let Ok(dock) = window.hwnd() else {
         return false;
     };
-    foreground_window_covers_monitor(dock)
+    dock_hwnd_monitor_has_fullscreen_window(dock)
 }
 
 #[cfg(target_os = "windows")]
-fn foreground_window_covers_monitor(dock: HWND) -> bool {
+fn dock_hwnd_monitor_has_fullscreen_window(dock: HWND) -> bool {
     unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.0.is_null() || foreground == dock || !IsWindowVisible(foreground).as_bool() {
-            return false;
-        }
-        if foreground == GetShellWindow()
-            || FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok() == Some(foreground)
-        {
-            return false;
-        }
-
-        let foreground_monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
         let dock_monitor = MonitorFromWindow(dock, MONITOR_DEFAULTTONEAREST);
-        if foreground_monitor.0.is_null()
-            || dock_monitor.0.is_null()
-            || foreground_monitor != dock_monitor
-        {
+        if dock_monitor.0.is_null() {
             return false;
         }
+        let shell = GetShellWindow();
+        let taskbar = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok();
+        let Ok(mut current) = GetTopWindow(None) else {
+            return false;
+        };
 
         let mut monitor_info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        if !GetMonitorInfoW(foreground_monitor, &mut monitor_info).as_bool() {
+        if !GetMonitorInfoW(dock_monitor, &mut monitor_info).as_bool() {
             return false;
         }
 
-        let mut bounds = RECT::default();
-        if DwmGetWindowAttribute(
-            foreground,
-            DWMWA_EXTENDED_FRAME_BOUNDS,
-            &mut bounds as *mut RECT as *mut std::ffi::c_void,
-            std::mem::size_of::<RECT>() as u32,
-        )
-        .is_err()
-        {
-            return false;
-        }
+        for _ in 0..2048 {
+            if current != dock
+                && current != shell
+                && taskbar != Some(current)
+                && IsWindowVisible(current).as_bool()
+                && !IsIconic(current).as_bool()
+                && MonitorFromWindow(current, MONITOR_DEFAULTTONEAREST) == dock_monitor
+            {
+                let mut cloaked = 0u32;
+                let is_cloaked = DwmGetWindowAttribute(
+                    current,
+                    DWMWA_CLOAKED,
+                    &mut cloaked as *mut u32 as *mut std::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                )
+                .is_ok()
+                    && cloaked != 0;
+                let mut bounds = RECT::default();
+                if !is_cloaked
+                    && DwmGetWindowAttribute(
+                        current,
+                        DWMWA_EXTENDED_FRAME_BOUNDS,
+                        &mut bounds as *mut RECT as *mut std::ffi::c_void,
+                        std::mem::size_of::<RECT>() as u32,
+                    )
+                    .is_ok()
+                    && rect_covers_monitor(bounds, monitor_info.rcMonitor)
+                {
+                    return true;
+                }
+            }
 
-        rect_covers_monitor(bounds, monitor_info.rcMonitor)
+            let Ok(next) = GetWindow(current, GW_HWNDNEXT) else {
+                break;
+            };
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        false
     }
 }
 
@@ -1406,7 +1425,7 @@ fn lower_dock_hwnd(hwnd: HWND) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn foreground_window_covers_dock_monitor(_: &WebviewWindow) -> bool {
+fn dock_monitor_has_fullscreen_window(_: &WebviewWindow) -> bool {
     false
 }
 
@@ -1417,7 +1436,7 @@ fn lower_dock_window(_: &WebviewWindow) -> bool {
 
 fn update_dock_z_order(window: &WebviewWindow, state: &AppState) {
     let is_yielding = state.dock_yielding_to_fullscreen.load(Ordering::Relaxed);
-    if foreground_window_covers_dock_monitor(window) {
+    if dock_monitor_has_fullscreen_window(window) {
         if !is_yielding && lower_dock_window(window) {
             state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
         }
