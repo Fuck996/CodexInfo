@@ -42,7 +42,7 @@ use windows::{
             FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetMessageW,
             GetShellWindow, GetWindow, GetWindowRect, IsWindowVisible, SetWindowPos,
             EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDPREV, HWND_BOTTOM,
-            HWND_TOPMOST, MSG,
+            HWND_NOTOPMOST, HWND_TOPMOST, MSG,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT,
         },
     },
@@ -1233,6 +1233,19 @@ fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
 #[cfg(target_os = "windows")]
 fn keep_dock_hwnd_above_taskbar(hwnd: HWND) -> bool {
     unsafe {
+        if SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .is_err()
+        {
+            return false;
+        }
         SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -1415,31 +1428,6 @@ fn update_dock_z_order(window: &WebviewWindow, state: &AppState) {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn update_dock_hwnd_z_order(hwnd: HWND, state: &AppState) {
-    if !state.dock_enabled.load(Ordering::Relaxed) {
-        return;
-    }
-    let is_yielding = state.dock_yielding_to_fullscreen.load(Ordering::Relaxed);
-    let fullscreen = foreground_window_covers_monitor(hwnd);
-    let above_taskbar = dock_hwnd_is_above_taskbar(hwnd);
-    if fullscreen {
-        if !is_yielding && lower_dock_hwnd(hwnd) {
-            state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
-        }
-    } else if (is_yielding || !above_taskbar)
-        && keep_dock_hwnd_above_taskbar(hwnd)
-    {
-        state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn find_current_dock_hwnd() -> Option<HWND> {
-    unsafe { FindWindowW(PCWSTR::null(), w!("Codex Usage Dock")).ok() }
-}
-
-#[cfg(not(target_os = "windows"))]
 fn refresh_dock_z_order(app: &AppHandle, state: &AppState) {
     if !state.dock_enabled.load(Ordering::Relaxed) {
         return;
@@ -1487,16 +1475,18 @@ unsafe extern "system" fn dock_z_order_event_proc(
 }
 
 #[cfg(target_os = "windows")]
-fn start_dock_z_order_watcher(_: AppHandle, state: AppState) {
+fn start_dock_z_order_watcher(app: AppHandle, state: AppState) {
     let (tx, rx) = mpsc::channel::<()>();
     let _ = DOCK_Z_ORDER_EVENTS.set(tx);
 
     thread::spawn(move || {
         while rx.recv().is_ok() {
             while rx.try_recv().is_ok() {}
-            if let Some(hwnd) = find_current_dock_hwnd() {
-                update_dock_hwnd_z_order(hwnd, &state);
-            }
+            let callback_app = app.clone();
+            let callback_state = state.clone();
+            let _ = app.run_on_main_thread(move || {
+                refresh_dock_z_order(&callback_app, &callback_state);
+            });
         }
     });
 
@@ -1522,17 +1512,6 @@ fn start_dock_z_order_watcher(_: AppHandle, state: AppState) {
 #[cfg(not(target_os = "windows"))]
 fn start_dock_z_order_watcher(_: AppHandle, _: AppState) {}
 
-#[cfg(target_os = "windows")]
-fn start_dock_z_order_maintenance(_: &AppHandle, state: AppState) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(750));
-        if let Some(hwnd) = find_current_dock_hwnd() {
-            update_dock_hwnd_z_order(hwnd, &state);
-        }
-    });
-}
-
-#[cfg(not(target_os = "windows"))]
 fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
     let app = app.clone();
     thread::spawn(move || loop {
