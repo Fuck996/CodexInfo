@@ -39,11 +39,12 @@ use windows::{
         },
         UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
         UI::WindowsAndMessaging::{
-            FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetShellWindow, GetTopWindow,
-            GetWindow, GetWindowRect, IsIconic, IsWindowVisible, SetWindowPos,
-            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, GW_HWNDNEXT, GW_HWNDPREV,
-            HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, MSG,
+            FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetShellWindow,
+            GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic,
+            IsWindowVisible, SetWindowPos, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
+            GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, MSG,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT,
+            WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -1329,6 +1330,7 @@ fn dock_hwnd_monitor_has_fullscreen_window(dock: HWND) -> bool {
                 && taskbar != Some(current)
                 && IsWindowVisible(current).as_bool()
                 && !IsIconic(current).as_bool()
+                && window_can_cover_dock(current)
                 && MonitorFromWindow(current, MONITOR_DEFAULTTONEAREST) == dock_monitor
             {
                 let mut cloaked = 0u32;
@@ -1376,6 +1378,17 @@ fn rect_covers_monitor(bounds: RECT, monitor: RECT) -> bool {
         && bounds.bottom >= monitor.bottom - EDGE_TOLERANCE
 }
 
+#[cfg(target_os = "windows")]
+fn window_can_cover_dock(hwnd: HWND) -> bool {
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 };
+    window_style_can_cover_dock(ex_style)
+}
+
+#[cfg(target_os = "windows")]
+fn window_style_can_cover_dock(ex_style: u32) -> bool {
+    ex_style & WS_EX_TOOLWINDOW.0 == 0 || ex_style & WS_EX_APPWINDOW.0 != 0
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod dock_z_order_tests {
     use super::*;
@@ -1397,6 +1410,16 @@ mod dock_z_order_tests {
 
         assert!(rect_covers_monitor(monitor, monitor));
         assert!(!rect_covers_monitor(maximized_work_area, monitor));
+    }
+
+    #[test]
+    fn tool_windows_do_not_count_as_fullscreen_apps() {
+        let handwriting_canvas = WS_EX_TOOLWINDOW.0 | 0x0800_0000 | 0x0008_0000;
+        assert!(!window_style_can_cover_dock(handwriting_canvas));
+        assert!(window_style_can_cover_dock(0x0004_0110));
+        assert!(window_style_can_cover_dock(
+            WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0
+        ));
     }
 }
 
