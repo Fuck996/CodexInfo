@@ -679,6 +679,13 @@ button {
   white-space: nowrap;
 }
 
+.reset-empty {
+  margin: 10px 16px 14px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
 .reset-overview {
   display: block;
   min-height: 0;

@@ -333,40 +333,47 @@ export function App() {
         ? (snapshot.tokenUsage.input ?? 0) + (snapshot.tokenUsage.output ?? 0)
         : null;
   const resetCount = snapshot?.resetCredits?.available ?? sortedResets.length;
-  const canExpand = sortedResets.length > 0;
+  const canExpand = resetCount > 0 && sortedResets.length > 0;
+  const resetExpanded = expanded && canExpand;
+  const extraHeight = (resetExpanded
+    ? resetDetailBaseExtraHeight + resetDetailRowExtraHeight * Math.min(sortedResets.length, 12)
+    : 0) + (tokenExpanded ? apiCostPanelExtraHeight : 0);
   const statusClass = codexConnected ? "is-connected" : loading ? "is-loading" : "is-offline";
   const statusTitle = codexConnected ? "Codex 已连接" : loading ? "正在连接 Codex" : "Codex 未连接";
 
-  function expandedExtraHeight(resetOpen: boolean, costOpen: boolean) {
-    const resetExtra = resetOpen && canExpand
-      ? resetDetailBaseExtraHeight + resetDetailRowExtraHeight * Math.min(sortedResets.length, 12)
-      : 0;
-    return resetExtra + (costOpen ? apiCostPanelExtraHeight : 0);
-  }
+  useEffect(() => {
+    if (!canExpand) {
+      setExpanded(false);
+    }
+  }, [canExpand]);
+
+  useEffect(() => {
+    if (currentWindowLabel === "main") {
+      void desktopApi.setExpanded(resetExpanded || tokenExpanded, extraHeight).catch((error) => {
+        console.error("调整组件高度失败", error);
+      });
+    }
+  }, [resetExpanded, tokenExpanded, extraHeight]);
 
   if (currentWindowLabel === "dock") {
     return <DockBar loading={loading} snapshot={snapshot} windows={windows} />;
   }
 
-  async function toggleExpanded() {
+  function toggleExpanded() {
     if (!canExpand) {
       return;
     }
 
-    const next = !expanded;
-    setExpanded(next);
-    await desktopApi.setExpanded(next || tokenExpanded, expandedExtraHeight(next, tokenExpanded));
+    setExpanded((previous) => !previous);
   }
 
-  async function toggleTokenExpanded() {
-    const next = !tokenExpanded;
-    setTokenExpanded(next);
-    await desktopApi.setExpanded(expanded || next, expandedExtraHeight(expanded, next));
+  function toggleTokenExpanded() {
+    setTokenExpanded((previous) => !previous);
   }
 
   return (
     <main
-      className={expanded ? "shell is-expanded" : "shell"}
+      className={resetExpanded ? "shell is-expanded" : "shell"}
       onMouseEnter={() => setHoverRegion("main", true)}
       onMouseLeave={() => setHoverRegion("main", false)}
     >
@@ -394,16 +401,20 @@ export function App() {
 
             <TokenBlock expanded={tokenExpanded} onToggle={toggleTokenExpanded} snapshot={snapshot} tokenUsed={tokenUsed} />
 
-            {canExpand && (
+            {canExpand ? (
               <ResetOverview
                 resets={sortedResets}
                 availableCount={resetCount}
-                expanded={expanded}
+                expanded={resetExpanded}
                 onToggle={toggleExpanded}
               />
+            ) : (
+              <div className="reset-empty" role="status">
+                {resetCount === 0 ? "没有重置次数" : `重置次数：${resetCount}`}
+              </div>
             )}
 
-            {expanded && sortedResets.length > 0 && (
+            {resetExpanded && (
               <ResetDetails resets={sortedResets} availableCount={resetCount} updatedAt={snapshot.updatedAt} />
             )}
           </>
