@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -74,6 +75,7 @@ struct AppState {
     dock_yielding_to_fullscreen: Arc<AtomicBool>,
     dock_pending_position: Arc<Mutex<Option<(i32, i32)>>>,
     latest_tray_usage: Arc<Mutex<Option<TrayUsageText>>>,
+    session_usage_cache: Arc<Mutex<HashMap<PathBuf, CachedSessionUsage>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,8 +215,22 @@ struct TokenUsageSample {
     token_usage: TokenUsage,
 }
 
+struct SessionUsage {
+    latest: Option<TokenCountEvent>,
+    samples: Vec<TokenUsageSample>,
+}
+
+struct CachedSessionUsage {
+    modified: std::time::SystemTime,
+    length: u64,
+    usage: SessionUsage,
+}
+
 fn codex_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".codex"))
+    match std::env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+        Some(path) => Some(PathBuf::from(path)),
+        None => dirs::home_dir().map(|home| home.join(".codex")),
+    }
 }
 
 fn sessions_path() -> Option<PathBuf> {
@@ -556,18 +572,17 @@ fn token_usage_total_value(usage: &TokenUsage) -> f64 {
     })
 }
 
-fn token_usage_samples_in_file(path: &Path) -> Vec<TokenUsageSample> {
-    let Ok(content) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-
+fn read_session_usage(reader: impl BufRead, path: &Path) -> Result<SessionUsage, String> {
     let mut samples = Vec::new();
+    let mut latest = None;
     let mut previous_total: Option<TokenUsage> = None;
 
-    for line in content.lines() {
-        let Some(event) = parse_token_count_line(line, path) else {
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("读取会话 {} 失败: {error}", path.display()))?;
+        let Some(event) = parse_token_count_line(&line, path) else {
             continue;
         };
+        latest = Some(event.clone());
         let Some(info) = event.payload.get("info") else {
             continue;
         };
@@ -601,17 +616,7 @@ fn token_usage_samples_in_file(path: &Path) -> Vec<TokenUsageSample> {
         }
     }
 
-    samples
-}
-
-fn latest_token_count_in_file(path: &Path) -> Option<TokenCountEvent> {
-    let content = fs::read_to_string(path).ok()?;
-    for line in content.lines().rev() {
-        if let Some(event) = parse_token_count_line(line, path) {
-            return Some(event);
-        }
-    }
-    None
+    Ok(SessionUsage { latest, samples })
 }
 
 fn recent_session_files() -> Vec<PathBuf> {
@@ -641,18 +646,31 @@ fn recent_session_files() -> Vec<PathBuf> {
         .collect()
 }
 
-fn find_latest_token_counts() -> Vec<TokenCountEvent> {
-    recent_session_files()
-        .into_iter()
-        .filter_map(|path| latest_token_count_in_file(&path))
-        .collect()
-}
-
-fn find_token_usage_samples() -> Vec<TokenUsageSample> {
-    recent_session_files()
-        .into_iter()
-        .flat_map(|path| token_usage_samples_in_file(&path))
-        .collect()
+fn find_session_usage(state: &AppState) -> Result<(Vec<TokenCountEvent>, Vec<TokenUsageSample>), String> {
+    let paths = recent_session_files();
+    let mut cache = state.session_usage_cache.lock().map_err(|error| error.to_string())?;
+    cache.retain(|path, _| paths.contains(path));
+    let mut events = Vec::new();
+    let mut samples = Vec::new();
+    for path in paths {
+        let metadata = fs::metadata(&path).map_err(|error| format!("读取会话 {} 属性失败: {error}", path.display()))?;
+        let modified = metadata.modified().map_err(|error| error.to_string())?;
+        let length = metadata.len();
+        let unchanged = cache.get(&path)
+            .map(|cached| cached.modified == modified && cached.length == length)
+            .unwrap_or(false);
+        if !unchanged {
+            cache.remove(&path);
+            let file = fs::File::open(&path).map_err(|error| format!("打开会话 {} 失败: {error}", path.display()))?;
+            let usage = read_session_usage(BufReader::new(file), &path)?;
+            cache.insert(path.clone(), CachedSessionUsage { modified, length, usage });
+        }
+        if let Some(cached) = cache.get(&path) {
+            events.extend(cached.usage.latest.iter().cloned());
+            samples.extend(cached.usage.samples.iter().cloned());
+        }
+    }
+    Ok((events, samples))
 }
 
 fn find_latest_token_count(events: &[TokenCountEvent]) -> Option<TokenCountEvent> {
@@ -660,6 +678,40 @@ fn find_latest_token_count(events: &[TokenCountEvent]) -> Option<TokenCountEvent
         .iter()
         .max_by_key(|event| event.timestamp.as_str())
         .cloned()
+}
+
+#[cfg(test)]
+mod session_usage_tests {
+    use super::*;
+
+    #[test]
+    fn streaming_scan_preserves_deltas_and_latest_event() {
+        let mut lines = Vec::new();
+        for total in [100, 160, 160, 20] {
+            lines.push(json!({
+                "timestamp": "2026-09-08T00:00:00Z",
+                "payload": { "type": "token_count", "info": {
+                    "total_token_usage": { "input_tokens": total, "total_tokens": total },
+                    "last_token_usage": { "input_tokens": 20, "total_tokens": 20 }
+                } }
+            }).to_string());
+        }
+        lines.push(json!({
+            "timestamp": "2026-09-08T00:01:00Z",
+            "payload": { "type": "token_count", "info": null }
+        }).to_string());
+        let content = lines.join("\n");
+        let usage = read_session_usage(content.as_bytes(), Path::new("session.jsonl")).unwrap();
+        let totals: Vec<_> = usage.samples.iter().map(|sample| sample.token_usage.total.unwrap()).collect();
+        assert_eq!(totals, vec![100.0, 60.0, 20.0]);
+        assert_eq!(usage.latest.unwrap().timestamp, "2026-09-08T00:01:00Z");
+    }
+
+    #[test]
+    fn streaming_scan_reports_read_errors() {
+        let invalid_utf8: &[u8] = &[0xff, b'\n'];
+        assert!(read_session_usage(invalid_utf8, Path::new("unreadable.jsonl")).is_err());
+    }
 }
 
 fn find_codex_cli_path() -> Option<PathBuf> {
@@ -1894,8 +1946,7 @@ async fn get_usage_snapshot(app: AppHandle) -> Result<UsageSnapshot, String> {
 
 fn get_usage_snapshot_blocking(app: AppHandle) -> Result<UsageSnapshot, String> {
     let explicit = read_explicit_snapshot(&app);
-    let session_events = find_latest_token_counts();
-    let token_samples = find_token_usage_samples();
+    let (session_events, token_samples) = find_session_usage(&app.state::<AppState>())?;
     let latest_session = find_latest_token_count(&session_events);
     let session_token = token_usage_from_session(latest_session.as_ref());
     let official = if explicit.is_none() {
@@ -2535,6 +2586,7 @@ pub fn run() {
         dock_yielding_to_fullscreen: Arc::new(AtomicBool::new(false)),
         dock_pending_position: Arc::new(Mutex::new(None)),
         latest_tray_usage: Arc::new(Mutex::new(None)),
+        session_usage_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let menu_state = state.clone();
     let window_state = state.clone();
