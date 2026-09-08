@@ -52,8 +52,6 @@ use windows::{
 const COLLAPSED_WIDTH: f64 = 460.0;
 const COLLAPSED_HEIGHT: f64 = 430.0;
 const MAX_EXPANDED_HEIGHT: f64 = 920.0;
-const DOCK_WIDTH: f64 = 250.0;
-const DOCK_HEIGHT: f64 = 42.0;
 const DOCK_TRAY_GAP: f64 = 12.0;
 const DOCK_EDGE_GAP: f64 = 4.0;
 const APP_SERVER_TIMEOUT_MS: u64 = 8_000;
@@ -1126,6 +1124,79 @@ fn tray_notify_rect() -> Option<()> {
     None
 }
 
+#[cfg(target_os = "windows")]
+fn dock_position(app: &AppHandle) -> Option<tauri::PhysicalPosition<f64>> {
+    let window = app.get_webview_window("dock")?;
+    let size = window.outer_size().ok()?;
+    let scale = window.scale_factor().ok()?;
+    let tray = tray_notify_rect()?;
+    let mut taskbar = RECT::default();
+    unsafe {
+        let hwnd = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
+        GetWindowRect(hwnd, &mut taskbar).ok()?;
+    }
+    taskbar_dock_position(taskbar, tray, size.width as f64, size.height as f64, DOCK_TRAY_GAP * scale)
+}
+
+#[cfg(target_os = "windows")]
+fn taskbar_dock_position(
+    taskbar: RECT,
+    tray: RECT,
+    width: f64,
+    height: f64,
+    gap: f64,
+) -> Option<tauri::PhysicalPosition<f64>> {
+    if taskbar.right <= taskbar.left || taskbar.bottom <= taskbar.top {
+        return None;
+    }
+    let (x, y) = if taskbar.right - taskbar.left >= taskbar.bottom - taskbar.top {
+        (
+            tray.left as f64 - width - gap,
+            (taskbar.top as f64 + taskbar.bottom as f64 - height) / 2.0,
+        )
+    } else {
+        (
+            (taskbar.left as f64 + taskbar.right as f64 - width) / 2.0,
+            tray.top as f64 - height - gap,
+        )
+    };
+    Some(tauri::PhysicalPosition::new(x, y))
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod dock_position_tests {
+    use super::*;
+
+    #[test]
+    fn centers_in_taskbar_at_each_scale_without_covering_tray() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for top in [0, 1032] {
+                let taskbar = RECT { left: 0, top, right: 3840, bottom: top + (48.0 * scale) as i32 };
+                let tray = RECT { left: 3000, top, right: 3840, bottom: taskbar.bottom };
+                let width = (250.0_f64 * scale).round();
+                let height = (42.0_f64 * scale).round();
+                let position = taskbar_dock_position(taskbar, tray, width, height, 12.0 * scale).unwrap();
+                let center = position.y.round() + height / 2.0;
+                assert!((center - (taskbar.top + taskbar.bottom) as f64 / 2.0).abs() <= 0.5);
+                assert!(position.x.round() + width <= tray.left as f64 - 12.0 * scale + 0.5);
+            }
+        }
+    }
+
+    #[test]
+    fn uses_actual_size_and_tracks_tray_expansion() {
+        let taskbar = RECT { left: -1920, top: 1032, right: 0, bottom: 1080 };
+        let mut tray = RECT { left: -300, top: 1032, right: 0, bottom: 1080 };
+        let first = taskbar_dock_position(taskbar, tray, 320.0, 44.0, 12.0).unwrap();
+        assert_eq!((first.x, first.y), (-632.0, 1034.0));
+        tray.left -= 120;
+        let expanded = taskbar_dock_position(taskbar, tray, 320.0, 44.0, 12.0).unwrap();
+        assert_eq!(expanded.x, first.x - 120.0);
+        assert_eq!(expanded.x + 320.0 + 12.0, tray.left as f64);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn dock_position(app: &AppHandle) -> Option<tauri::PhysicalPosition<f64>> {
     let monitor = app.primary_monitor().ok().flatten()?;
     let monitor_position = monitor.position();
@@ -1141,8 +1212,9 @@ fn dock_position(app: &AppHandle) -> Option<tauri::PhysicalPosition<f64>> {
     let work_top = work_area.position.y as f64;
     let work_right = work_left + work_area.size.width as f64;
     let work_bottom = work_top + work_area.size.height as f64;
-    let width = DOCK_WIDTH * scale_factor;
-    let height = DOCK_HEIGHT * scale_factor;
+    let size = app.get_webview_window("dock")?.outer_size().ok()?;
+    let width = size.width as f64;
+    let height = size.height as f64;
     let tray_gap = DOCK_TRAY_GAP * scale_factor;
     let edge_gap = DOCK_EDGE_GAP * scale_factor;
     let bottom_taskbar = bottom - work_bottom > edge_gap;
@@ -1561,7 +1633,7 @@ fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
         let callback_app = app.clone();
         let callback_state = state.clone();
         let _ = app.run_on_main_thread(move || {
-            refresh_dock_z_order(&callback_app, &callback_state);
+            update_dock_window(&callback_app, &callback_state, false);
         });
     });
 }
@@ -1637,30 +1709,25 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
     let visible = window.is_visible().unwrap_or(false);
 
     if enabled {
-        let scale_factor = app
-            .primary_monitor()
-            .ok()
-            .flatten()
-            .map(|monitor| monitor.scale_factor())
-            .unwrap_or(1.0);
-        let should_check_position = force || !visible || !dock_is_clear_of_tray(&window, scale_factor);
-
-        if should_check_position {
-            if let Some(position) = dock_position(app) {
-                if dock_position_is_stable(state, position, force) {
-                    let target_x = position.x.round() as i32;
-                    let target_y = position.y.round() as i32;
-                    let should_move = window
-                        .outer_position()
-                        .map(|current| (current.x - target_x).abs() > 1 || (current.y - target_y).abs() > 1)
-                        .unwrap_or(true);
-                    if should_move {
-                        move_dock_window(&window, position);
-                    }
-                }
+        let Some(position) = dock_position(app) else {
+            eprintln!("Cannot position dock: taskbar geometry is unavailable");
+            return;
+        };
+        let Ok(scale_factor) = window.scale_factor() else {
+            eprintln!("Cannot position dock: window scale factor is unavailable");
+            return;
+        };
+        let must_move = force || !visible || !dock_is_clear_of_tray(&window, scale_factor);
+        if dock_position_is_stable(state, position, must_move) {
+            let target_x = position.x.round() as i32;
+            let target_y = position.y.round() as i32;
+            let should_move = window
+                .outer_position()
+                .map(|current| (current.x - target_x).abs() > 1 || (current.y - target_y).abs() > 1)
+                .unwrap_or(true);
+            if should_move {
+                move_dock_window(&window, position);
             }
-        } else if let Ok(mut pending) = state.dock_pending_position.lock() {
-            *pending = None;
         }
 
         if !visible {
@@ -2473,7 +2540,11 @@ pub fn run() {
     let window_state = state.clone();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_denylist(&["dock"])
+                .build(),
+        )
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
