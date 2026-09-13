@@ -38,7 +38,10 @@ use windows::{
             Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
             Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
         },
-        UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK},
+        System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED},
+        UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK, CUIAutomation, IUIAutomation, TreeScope_Descendants,
+            UIA_ButtonControlTypeId, UIA_HyperlinkControlTypeId, UIA_ListItemControlTypeId,
+            UIA_MenuItemControlTypeId, UIA_TabItemControlTypeId},
         UI::WindowsAndMessaging::{
             FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetShellWindow,
             GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic,
@@ -76,6 +79,8 @@ struct AppState {
     dock_pending_position: Arc<Mutex<Option<(i32, i32)>>>,
     latest_tray_usage: Arc<Mutex<Option<TrayUsageText>>>,
     session_usage_cache: Arc<Mutex<HashMap<PathBuf, CachedSessionUsage>>>,
+    #[cfg(target_os = "windows")]
+    taskbar_controls: Arc<Mutex<Option<Vec<RECT>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1177,7 +1182,37 @@ fn tray_notify_rect() -> Option<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn dock_position(app: &AppHandle) -> Option<tauri::PhysicalPosition<f64>> {
+fn read_taskbar_controls() -> windows::core::Result<Vec<RECT>> {
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+        let result = (|| -> windows::core::Result<Vec<RECT>> {
+            let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+            let hwnd = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null())?;
+            let taskbar = automation.ElementFromHandle(hwnd)?;
+            let elements = taskbar.FindAll(TreeScope_Descendants, &automation.CreateTrueCondition()?)?;
+            let mut controls = Vec::new();
+            for index in 0..elements.Length()? {
+                let element = elements.GetElement(index)?;
+                let control_type = element.CurrentControlType()?;
+                if [UIA_ButtonControlTypeId, UIA_HyperlinkControlTypeId, UIA_ListItemControlTypeId,
+                    UIA_MenuItemControlTypeId, UIA_TabItemControlTypeId].contains(&control_type)
+                    && !element.CurrentIsOffscreen()?.as_bool()
+                {
+                    let rect = element.CurrentBoundingRectangle()?;
+                    if rect.right > rect.left && rect.bottom > rect.top {
+                        controls.push(rect);
+                    }
+                }
+            }
+            Ok(controls)
+        })();
+        CoUninitialize();
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn dock_position(app: &AppHandle, state: &AppState) -> Option<tauri::PhysicalPosition<f64>> {
     let window = app.get_webview_window("dock")?;
     let size = window.outer_size().ok()?;
     let scale = window.scale_factor().ok()?;
@@ -1187,7 +1222,20 @@ fn dock_position(app: &AppHandle) -> Option<tauri::PhysicalPosition<f64>> {
         let hwnd = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
         GetWindowRect(hwnd, &mut taskbar).ok()?;
     }
-    taskbar_dock_position(taskbar, tray, size.width as f64, size.height as f64, DOCK_TRAY_GAP * scale)
+    let controls = state.taskbar_controls.lock().ok()?;
+    let gap = DOCK_TRAY_GAP * scale;
+    if let Some(position) = taskbar_dock_position(taskbar, tray, size.width as f64, size.height as f64, gap, controls.as_ref()?) {
+        return Some(position);
+    }
+    let monitor = app.primary_monitor().ok().flatten()?;
+    let work = monitor.work_area();
+    let x = work.position.x as f64 + gap;
+    let y = if taskbar.bottom <= work.position.y {
+        work.position.y as f64 + gap
+    } else {
+        work.position.y as f64 + work.size.height as f64 - size.height as f64 - gap
+    };
+    Some(tauri::PhysicalPosition::new(x, y))
 }
 
 #[cfg(target_os = "windows")]
@@ -1197,6 +1245,7 @@ fn taskbar_dock_position(
     width: f64,
     height: f64,
     gap: f64,
+    controls: &[RECT],
 ) -> Option<tauri::PhysicalPosition<f64>> {
     if taskbar.right <= taskbar.left || taskbar.bottom <= taskbar.top {
         return None;
@@ -1212,12 +1261,62 @@ fn taskbar_dock_position(
             tray.top as f64 - height - gap,
         )
     };
-    Some(tauri::PhysicalPosition::new(x, y))
+    let overlaps = |x: f64, y: f64| controls.iter().chain(std::iter::once(&tray)).any(|rect| {
+        x < rect.right as f64 + gap && x + width + gap > rect.left as f64
+            && y < rect.bottom as f64 && y + height > rect.top as f64
+    });
+    if x >= taskbar.left as f64 && x + width <= taskbar.right as f64
+        && y >= taskbar.top as f64 && y + height <= taskbar.bottom as f64
+        && !overlaps(x, y)
+    {
+        return Some(tauri::PhysicalPosition::new(x, y));
+    }
+    if taskbar.right - taskbar.left >= taskbar.bottom - taskbar.top {
+        let mut candidates = vec![taskbar.left as f64 + gap];
+        candidates.extend(controls.iter().map(|rect| rect.right as f64 + gap));
+        candidates.sort_by(f64::total_cmp);
+        candidates.into_iter()
+            .find(|candidate| *candidate >= taskbar.left as f64 + gap
+                && *candidate + width + gap <= tray.left as f64 && !overlaps(*candidate, y))
+            .map(|candidate| tauri::PhysicalPosition::new(candidate, y))
+    } else {
+        let mut candidates = vec![taskbar.top as f64 + gap];
+        candidates.extend(controls.iter().map(|rect| rect.bottom as f64 + gap));
+        candidates.sort_by(f64::total_cmp);
+        candidates.into_iter()
+            .find(|candidate| *candidate >= taskbar.top as f64 + gap
+                && *candidate + height + gap <= tray.top as f64 && !overlaps(x, *candidate))
+            .map(|candidate| tauri::PhysicalPosition::new(x, candidate))
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]
 mod dock_position_tests {
     use super::*;
+
+    #[test]
+    fn crowded_taskbar_moves_to_leftmost_free_region() {
+        let taskbar = RECT { left: 0, top: 1516, right: 2560, bottom: 1600 };
+        let tray = RECT { left: 2145, top: 1516, right: 2560, bottom: 1600 };
+        let apps = RECT { left: 663, top: 1516, right: 1897, bottom: 1600 };
+        let position = taskbar_dock_position(taskbar, tray, 438.0, 74.0, 21.0, &[apps]).unwrap();
+        assert_eq!((position.x, position.y), (21.0, 1521.0));
+        let widgets = RECT { left: 0, top: 1516, right: 100, bottom: 1600 };
+        let position = taskbar_dock_position(taskbar, tray, 438.0, 74.0, 21.0, &[apps, widgets]).unwrap();
+        assert_eq!(position.x, 121.0);
+    }
+
+    #[test]
+    fn sparse_taskbar_keeps_right_position_and_full_bar_has_no_slot() {
+        let taskbar = RECT { left: -2560, top: 1516, right: 0, bottom: 1600 };
+        let tray = RECT { left: -415, top: 1516, right: 0, bottom: 1600 };
+        let mut apps = RECT { left: -1800, top: 1516, right: -1100, bottom: 1600 };
+        let position = taskbar_dock_position(taskbar, tray, 438.0, 74.0, 21.0, &[apps]).unwrap();
+        assert_eq!(position.x, -874.0);
+        apps.left = -2560;
+        apps.right = -415;
+        assert!(taskbar_dock_position(taskbar, tray, 438.0, 74.0, 21.0, &[apps]).is_none());
+    }
 
     #[test]
     fn centers_in_taskbar_at_each_scale_without_covering_tray() {
@@ -1227,7 +1326,7 @@ mod dock_position_tests {
                 let tray = RECT { left: 3000, top, right: 3840, bottom: taskbar.bottom };
                 let width = (250.0_f64 * scale).round();
                 let height = (42.0_f64 * scale).round();
-                let position = taskbar_dock_position(taskbar, tray, width, height, 12.0 * scale).unwrap();
+                let position = taskbar_dock_position(taskbar, tray, width, height, 12.0 * scale, &[]).unwrap();
                 let center = position.y.round() + height / 2.0;
                 assert!((center - (taskbar.top + taskbar.bottom) as f64 / 2.0).abs() <= 0.5);
                 assert!(position.x.round() + width <= tray.left as f64 - 12.0 * scale + 0.5);
@@ -1239,17 +1338,17 @@ mod dock_position_tests {
     fn uses_actual_size_and_tracks_tray_expansion() {
         let taskbar = RECT { left: -1920, top: 1032, right: 0, bottom: 1080 };
         let mut tray = RECT { left: -300, top: 1032, right: 0, bottom: 1080 };
-        let first = taskbar_dock_position(taskbar, tray, 320.0, 44.0, 12.0).unwrap();
+        let first = taskbar_dock_position(taskbar, tray, 320.0, 44.0, 12.0, &[]).unwrap();
         assert_eq!((first.x, first.y), (-632.0, 1034.0));
         tray.left -= 120;
-        let expanded = taskbar_dock_position(taskbar, tray, 320.0, 44.0, 12.0).unwrap();
+        let expanded = taskbar_dock_position(taskbar, tray, 320.0, 44.0, 12.0, &[]).unwrap();
         assert_eq!(expanded.x, first.x - 120.0);
         assert_eq!(expanded.x + 320.0 + 12.0, tray.left as f64);
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn dock_position(app: &AppHandle) -> Option<tauri::PhysicalPosition<f64>> {
+fn dock_position(app: &AppHandle, _: &AppState) -> Option<tauri::PhysicalPosition<f64>> {
     let monitor = app.primary_monitor().ok().flatten()?;
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
@@ -1682,6 +1781,19 @@ fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
     let app = app.clone();
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(750));
+        #[cfg(target_os = "windows")]
+        if state.dock_enabled.load(Ordering::Relaxed) {
+            let controls = match read_taskbar_controls() {
+                Ok(controls) => Some(controls),
+                Err(error) => {
+                    eprintln!("读取任务栏操作区失败: {error}");
+                    None
+                }
+            };
+            if let Ok(mut current) = state.taskbar_controls.lock() {
+                *current = controls;
+            }
+        }
         let callback_app = app.clone();
         let callback_state = state.clone();
         let _ = app.run_on_main_thread(move || {
@@ -1691,7 +1803,7 @@ fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
 }
 
 #[cfg(target_os = "windows")]
-fn dock_is_clear_of_tray(window: &WebviewWindow, scale_factor: f64) -> bool {
+fn dock_is_clear_of_taskbar_controls(window: &WebviewWindow, scale_factor: f64, state: &AppState) -> bool {
     let Some(tray) = tray_notify_rect() else {
         return false;
     };
@@ -1707,16 +1819,20 @@ fn dock_is_clear_of_tray(window: &WebviewWindow, scale_factor: f64) -> bool {
     let dock_right = position.x + size.width as i32;
     let dock_top = position.y;
     let dock_bottom = position.y + size.height as i32;
-    let vertically_overlaps = dock_bottom > tray.top && dock_top < tray.bottom;
-    if !vertically_overlaps {
-        return true;
-    }
-
-    dock_right + gap <= tray.left || dock_left >= tray.right + gap
+    let Ok(controls) = state.taskbar_controls.lock() else {
+        return false;
+    };
+    let Some(controls) = controls.as_ref() else {
+        return false;
+    };
+    controls.iter().chain(std::iter::once(&tray)).all(|rect| {
+        dock_bottom <= rect.top || dock_top >= rect.bottom
+            || dock_right + gap <= rect.left || dock_left >= rect.right + gap
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
-fn dock_is_clear_of_tray(_: &WebviewWindow, _: f64) -> bool {
+fn dock_is_clear_of_taskbar_controls(_: &WebviewWindow, _: f64, _: &AppState) -> bool {
     true
 }
 
@@ -1761,7 +1877,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
     let visible = window.is_visible().unwrap_or(false);
 
     if enabled {
-        let Some(position) = dock_position(app) else {
+        let Some(position) = dock_position(app, state) else {
             eprintln!("Cannot position dock: taskbar geometry is unavailable");
             return;
         };
@@ -1769,7 +1885,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
             eprintln!("Cannot position dock: window scale factor is unavailable");
             return;
         };
-        let must_move = force || !visible || !dock_is_clear_of_tray(&window, scale_factor);
+        let must_move = force || !visible || !dock_is_clear_of_taskbar_controls(&window, scale_factor, state);
         if dock_position_is_stable(state, position, must_move) {
             let target_x = position.x.round() as i32;
             let target_y = position.y.round() as i32;
@@ -2587,6 +2703,8 @@ pub fn run() {
         dock_pending_position: Arc::new(Mutex::new(None)),
         latest_tray_usage: Arc::new(Mutex::new(None)),
         session_usage_cache: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(target_os = "windows")]
+        taskbar_controls: Arc::new(Mutex::new(None)),
     };
     let menu_state = state.clone();
     let window_state = state.clone();

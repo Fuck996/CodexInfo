@@ -1,6 +1,6 @@
 [package]
 name = "codex-info"
-version = "1.0.24"
+version = "1.0.25"
 description = "Codex usage desktop widget"
 authors = ["CodexInfo"]
 edition = "2021"
@@ -22,4 +22,4 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-window-state = "2"
 walkdir = "2"
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
