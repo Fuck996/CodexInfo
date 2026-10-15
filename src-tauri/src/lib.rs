@@ -1548,9 +1548,12 @@ fn dock_hwnd_monitor_has_fullscreen_window(dock: HWND) -> bool {
         }
 
         for _ in 0..2048 {
+            // 任务栏后方的全屏窗口和阴影不应触发前台全屏避让。
+            if taskbar == Some(current) {
+                break;
+            }
             if current != dock
                 && current != shell
-                && taskbar != Some(current)
                 && IsWindowVisible(current).as_bool()
                 && !IsIconic(current).as_bool()
                 && window_can_cover_dock(current)
