@@ -1,3 +1,5 @@
+mod diagnostics;
+
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
 use reqwest::{blocking::Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -2561,6 +2563,7 @@ fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
             }
         }
         "quit" => {
+            diagnostics::record("quit requested from menu");
             let _ = app.save_window_state(StateFlags::POSITION);
             app.exit(0);
         }
@@ -2739,6 +2742,14 @@ pub fn run() {
             handle_menu_event(app, &menu_state, event.id.as_ref());
         })
         .setup(move |app| {
+            match app.path().app_log_dir() {
+                Ok(directory) => {
+                    if let Err(error) = diagnostics::initialize(&directory) {
+                        eprintln!("初始化诊断日志失败: {error}");
+                    }
+                }
+                Err(error) => eprintln!("获取诊断日志目录失败: {error}"),
+            }
             create_tray(app.handle(), state.clone())?;
             let stored_settings = read_stored_settings(app.handle()).unwrap_or_default();
             let dock_enabled = stored_settings.dock_enabled || stored_settings.taskbar_usage_enabled;
@@ -2798,6 +2809,23 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_, event| match event {
+            tauri::RunEvent::Ready => diagnostics::record("event loop ready"),
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                diagnostics::record(&format!("exit requested code={code:?}"));
+            }
+            tauri::RunEvent::Exit => diagnostics::record("event loop exit"),
+            tauri::RunEvent::WindowEvent { label, event, .. } => match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    diagnostics::record(&format!("window close requested label={label}"));
+                }
+                tauri::WindowEvent::Destroyed => {
+                    diagnostics::record(&format!("window destroyed label={label}"));
+                }
+                _ => {}
+            },
+            _ => {}
+        });
 }
