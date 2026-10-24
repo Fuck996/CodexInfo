@@ -8,6 +8,7 @@ import { Settings2 } from "lucide-react";
 import { DisplaySettings } from "./DisplaySettings";
 import { UsageAnalytics } from "./UsageAnalytics";
 import dockIcon from "./assets/dock-icon.png";
+import claudeIcon from "./assets/claude-icon.png";
 
 const refreshIntervalMs = 5_000;
 const apiCostPanelExtraHeight = 330;
@@ -100,7 +101,7 @@ function formatResetDistance(value: string) {
   const days = Math.floor(seconds / 86400);
   const hours = Math.floor((seconds % 86400) / 3600);
   if (days > 0) {
-    return `${days}天`;
+    return `${days}天${hours}小时`;
   }
   return `${hours}小时`;
 }
@@ -369,7 +370,7 @@ export function App() {
         <div className="chrome drag-region" data-tauri-drag-region>
           <div className="brand">
             <span className="brand-icon-wrap" title={statusTitle}>
-              {provider === "codex" ? <img className="brand-icon" src={dockIcon} alt="" /> : <span className="claude-mark" aria-hidden="true">C</span>}
+              <img className="brand-icon" src={provider === "codex" ? dockIcon : claudeIcon} alt="" />
               <span className={`status-dot ${statusClass}`} />
             </span>
             <strong className="brand-title"><span>{providerName.toUpperCase()}</span><em>用量核心</em></strong>
@@ -458,7 +459,7 @@ function DockBar({
       }}
     >
       <section className={singleWindow ? "dock-widget is-single" : "dock-widget"} aria-label={`${provider} 用量悬浮条`} title={error || (snapshot ? `最近读数：${formatFullDate(snapshot.updatedAt)}` : "等待用量数据")}>
-        {provider === "codex" ? <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={dockIcon} alt="Codex" /> : <span className="claude-mark dock-icon" aria-label="Claude">C</span>}
+        <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={provider === "codex" ? dockIcon : claudeIcon} alt={provider === "codex" ? "Codex" : "Claude"} />
         <div className={singleWindow ? "dock-meters is-single" : "dock-meters"}>
           {windows.length === 0 && <span className="dock-empty">{provider === "claude" ? "Claude" : "Codex"} · {loading ? "读取中…" : "等待数据 · 右键设置"}</span>}
           {windows.map((usageWindow) => (
@@ -490,7 +491,7 @@ function DockMeter({
       </div>
       {single && <span className="dock-percent">{remainingPercent}%</span>}
       <strong>{label}</strong>
-      <span className="dock-reset">{single ? `· ${resetText}` : `${remainingPercent}% · ${resetText}`}</span>
+      <span className="dock-reset" title={`重置时间：${formatFullDate(window.resetAt)}`}>{single ? `· ${resetText}` : `${remainingPercent}% · ${resetText}`}</span>
     </div>
   );
 }
