@@ -59,7 +59,7 @@ export function UsageAnalytics({ snapshot, expanded, onToggle }: { snapshot: Usa
         {(current?.unknownPriceModels.length ?? 0) > 0 && <p className="price-gap">未定价模型：{current?.unknownPriceModels.join("、")}。成本总额不完整，显示为 --。</p>}
         {(previous?.unknownPriceModels.length ?? 0) > 0 && <p className="price-gap">上周期未定价模型：{previous?.unknownPriceModels.join("、")}。</p>}
         <p>Token 仅统计本机已记录的请求；未采集的历史不补零。Claude 从插件接入后记录，Codex 可读取现存会话日志。</p>
-        <p>按平台实际重置时间划分 5 小时 / 7 天窗口。额度回落可能来自银行重置或平台调整，原因未确认；回落区间不参与每 1% 统计。</p>
+        <p>按实际重置时间划分窗口。读数取整未增长时先累计请求，增长后再计入每 1%；尾部未反映的请求暂不计入。额度回落原因未确认，回落区间不参与该指标。</p>
         <p>总量受周期进度影响，优先比较每 1% 的 Token 与成本，并核对模型及缓存比例。跨设备、网页用量和采样缺口都会影响结果，不能仅凭此认定平台减额。</p>
         <p>按 2026-10-24 官方标准短上下文单价统一估算，不含工具等费用及速度、地域溢价。缓存写入未提供 TTL 时显示价格区间；这不是实际账单。</p>
       </div>

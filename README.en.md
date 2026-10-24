@@ -58,7 +58,7 @@ Readings update with Code sessions, rather than independent online polling. Expi
 
 Cycles use the platform's reset timestamp and window duration instead of calendar weeks/months. Codex statistics include existing active and archived logs, with no 120-file cutoff and metadata caching. The previous window must have been observed; missing history remains unavailable. Statistics cover recorded requests on this machine, excluding unrecorded sessions, other devices, and web usage.
 
-Per-percentage-point statistics match Tokens to the interval between adjacent quota readings. Intervals where usage decreases are excluded; a decrease is recorded without assuming it was a banked reset. Compare model/cache usage and sampling coverage as well as normalized consumption. These observations alone cannot prove a reduction in the provider's limits.
+Per-percentage-point statistics match Tokens to quota changes over the same intervals. When rounded readings do not move, requests wait until the meter advances; trailing requests not yet reflected in quota remain excluded. Intervals where usage decreases are excluded, without assuming the cause was a banked reset. Compare model/cache usage and sampling coverage as well. These observations alone cannot prove a reduction in the provider's limits.
 
 API-equivalent costs use each model's official standard short-context prices as of **2026-10-24** as a fixed comparison basis. Unknown model prices remain unavailable. Cache writes with an unknown TTL produce a price range. This is not the subscription quota formula or an invoice and excludes tool fees and context/speed/region premiums.
 

@@ -212,6 +212,10 @@ fn summarize(
     let mut matched_low = 0.0;
     let mut matched_high = 0.0;
     let mut matched_priced = true;
+    let mut pending_tokens = 0.0;
+    let mut pending_low = 0.0;
+    let mut pending_high = 0.0;
+    let mut pending_priced = true;
     for pair in readings.windows(2) {
         let [(from, before), (until, after)] = pair else {
             unreachable!()
@@ -221,23 +225,34 @@ fn summarize(
         }
         if after < before {
             drops += 1;
+            pending_tokens = 0.0;
+            pending_low = 0.0;
+            pending_high = 0.0;
+            pending_priced = true;
             continue;
         }
         let delta = after - before;
-        if delta <= 0.0 {
-            continue;
-        }
-        percent += delta;
         let begin = samples.partition_point(|(at, _)| at <= from);
         let finish = samples.partition_point(|(at, _)| at <= until);
         for (_, sample) in &samples[begin..finish] {
-            matched_tokens += sample.token_usage.total.unwrap_or(0.0);
+            pending_tokens += sample.token_usage.total.unwrap_or(0.0);
             if let Some((min, max)) = cost(sample, provider) {
-                matched_low += min;
-                matched_high += max;
+                pending_low += min;
+                pending_high += max;
             } else {
-                matched_priced = false;
+                pending_priced = false;
             }
+        }
+        if delta > 0.0 {
+            percent += delta;
+            matched_tokens += pending_tokens;
+            matched_low += pending_low;
+            matched_high += pending_high;
+            matched_priced &= pending_priced;
+            pending_tokens = 0.0;
+            pending_low = 0.0;
+            pending_high = 0.0;
+            pending_priced = true;
         }
     }
     let has_samples = !cycle_samples.is_empty();
@@ -405,5 +420,19 @@ mod tests {
         );
         assert_eq!(summary.sample_count, 0);
         assert_eq!(summary.cost_low_usd, None);
+    }
+
+    #[test]
+    fn rounded_quota_readings_keep_requests_until_the_meter_advances() {
+        let end = "2026-10-25T00:00:00Z";
+        let points = [("2026-10-24T00:00:00Z", 10), ("2026-10-24T01:00:00Z", 10), ("2026-10-24T02:00:00Z", 11), ("2026-10-24T03:00:00Z", 11)]
+            .into_iter().map(|(at, used)| serde_json::from_value(json!({"at": at, "windows": [{"id":"weekly","label":"7天","used":used,"total":100,"resetAt":end,"windowDurationMins":10080}]})).unwrap()).collect::<Vec<Observation>>();
+        let records = [sample("2026-10-24T01:00:00Z"), sample("2026-10-24T02:00:00Z"), sample("2026-10-24T03:00:00Z")];
+        let timed = records.iter().map(|sample| (DateTime::parse_from_rfc3339(&sample.timestamp).unwrap().with_timezone(&Utc), sample)).collect::<Vec<_>>();
+        let end = DateTime::parse_from_rfc3339(end).unwrap().with_timezone(&Utc);
+        let summary = summarize(end - Duration::days(7), end, 10080, &points, &timed, "codex");
+        assert_eq!(summary.observed_percent, 1.0);
+        assert_eq!(summary.tokens_per_percent, Some(2_200_000.0));
+        assert_eq!(summary.cost_per_percent_low, Some(4.1));
     }
 }
