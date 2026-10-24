@@ -1,0 +1,409 @@
+use super::{
+    empty_token_usage, merge_token_usage, TokenUsage, TokenUsageSample, UsageSnapshot, UsageWindow,
+};
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::Path,
+};
+
+#[derive(Default)]
+pub(super) struct History {
+    observations: HashMap<String, Vec<Observation>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Observation {
+    at: DateTime<Utc>,
+    windows: Vec<UsageWindow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CycleComparison {
+    window_id: String,
+    label: String,
+    current: CycleSummary,
+    previous: Option<CycleSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CycleSummary {
+    cache_write_tokens: f64,
+    start_at: String,
+    end_at: String,
+    token_usage: TokenUsage,
+    cost_low_usd: Option<f64>,
+    cost_high_usd: Option<f64>,
+    models: Vec<String>,
+    unknown_price_models: Vec<String>,
+    sample_count: usize,
+    observed_from: Option<String>,
+    observed_until: Option<String>,
+    observed_percent: f64,
+    tokens_per_percent: Option<f64>,
+    cost_per_percent_low: Option<f64>,
+    cost_per_percent_high: Option<f64>,
+    quota_drops: usize,
+}
+
+pub(super) fn enrich(
+    root: &Path,
+    history: &mut History,
+    snapshot: &mut UsageSnapshot,
+    samples: &[TokenUsageSample],
+) -> Result<(), String> {
+    let provider = snapshot.provider.label().to_lowercase();
+    let path = root.join(format!("quota-history-{provider}.jsonl"));
+    if !history.observations.contains_key(&provider) {
+        let mut observations = Vec::new();
+        if path.exists() {
+            for line in
+                BufReader::new(fs::File::open(&path).map_err(|error| error.to_string())?).lines()
+            {
+                observations.push(
+                    serde_json::from_str(&line.map_err(|error| error.to_string())?)
+                        .map_err(|error| format!("用量历史无法解析: {error}"))?,
+                );
+            }
+        }
+        history.observations.insert(provider.clone(), observations);
+    }
+    let observations = history
+        .observations
+        .get_mut(&provider)
+        .expect("history initialized");
+    let at = DateTime::parse_from_rfc3339(&snapshot.updated_at)
+        .map_err(|error| error.to_string())?
+        .with_timezone(&Utc);
+    if observations.last().is_none_or(|previous| previous.at < at) {
+        let observation = Observation {
+            at,
+            windows: snapshot.windows.clone(),
+        };
+        let serialized = serde_json::to_string(&observation).map_err(|error| error.to_string())?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        writeln!(file, "{serialized}").map_err(|error| format!("记录额度历史失败: {error}"))?;
+        observations.push(observation);
+    }
+    let mut points = observations.clone();
+    for sample in samples {
+        if sample.windows.is_empty() {
+            continue;
+        }
+        let at = DateTime::parse_from_rfc3339(&sample.timestamp)
+            .map_err(|error| error.to_string())?
+            .with_timezone(&Utc);
+        points.push(Observation {
+            at,
+            windows: sample.windows.clone(),
+        });
+    }
+    points.sort_by_key(|point| point.at);
+    let mut timed_samples = samples
+        .iter()
+        .map(|sample| {
+            DateTime::parse_from_rfc3339(&sample.timestamp)
+                .map(|at| (at.with_timezone(&Utc), sample))
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    timed_samples.sort_by_key(|(at, _)| *at);
+    snapshot.cycle_comparisons = snapshot
+        .windows
+        .iter()
+        .filter_map(|window| {
+            let end = DateTime::parse_from_rfc3339(&window.reset_at)
+                .ok()?
+                .with_timezone(&Utc);
+            if window.window_duration_mins == 0 {
+                return None;
+            }
+            let duration = Duration::minutes(window.window_duration_mins as i64);
+            let previous_end = points
+                .iter()
+                .flat_map(|point| point.windows.iter())
+                .filter(|candidate| candidate.window_duration_mins == window.window_duration_mins)
+                .filter_map(|candidate| {
+                    DateTime::parse_from_rfc3339(&candidate.reset_at)
+                        .ok()
+                        .map(|time| time.with_timezone(&Utc))
+                })
+                .filter(|time| *time < end)
+                .max();
+            Some(CycleComparison {
+                window_id: window.id.clone(),
+                label: window.label.clone(),
+                current: summarize(
+                    end - duration,
+                    end,
+                    window.window_duration_mins,
+                    &points,
+                    &timed_samples,
+                    &provider,
+                ),
+                previous: previous_end.map(|end| {
+                    summarize(
+                        end - duration,
+                        end,
+                        window.window_duration_mins,
+                        &points,
+                        &timed_samples,
+                        &provider,
+                    )
+                }),
+            })
+        })
+        .collect();
+    Ok(())
+}
+
+fn summarize(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    duration: u64,
+    points: &[Observation],
+    samples: &[(DateTime<Utc>, &TokenUsageSample)],
+    provider: &str,
+) -> CycleSummary {
+    let cycle_samples = samples
+        .iter()
+        .filter(|(at, _)| *at >= start && *at < end)
+        .map(|(_, sample)| *sample)
+        .collect::<Vec<_>>();
+    let mut usage = empty_token_usage();
+    let mut low = 0.0;
+    let mut high = 0.0;
+    let mut models = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
+    for sample in &cycle_samples {
+        merge_token_usage(&mut usage, &sample.token_usage);
+        models.insert(sample.model.clone());
+        if let Some((min, max)) = cost(sample, provider) {
+            low += min;
+            high += max;
+        } else {
+            unknown.insert(sample.model.clone());
+        }
+    }
+    let readings = points
+        .iter()
+        .filter(|point| point.at >= start && point.at < end)
+        .filter_map(|point| {
+            let window = point.windows.iter().find(|window| {
+                window.window_duration_mins == duration
+                    && DateTime::parse_from_rfc3339(&window.reset_at)
+                        .is_ok_and(|reset| reset.with_timezone(&Utc) == end)
+            })?;
+            Some((point.at, window.used / window.total * 100.0))
+        })
+        .collect::<Vec<_>>();
+    let mut drops = 0;
+    let mut percent = 0.0;
+    let mut matched_tokens = 0.0;
+    let mut matched_low = 0.0;
+    let mut matched_high = 0.0;
+    let mut matched_priced = true;
+    for pair in readings.windows(2) {
+        let [(from, before), (until, after)] = pair else {
+            unreachable!()
+        };
+        if until <= from {
+            continue;
+        }
+        if after < before {
+            drops += 1;
+            continue;
+        }
+        let delta = after - before;
+        if delta <= 0.0 {
+            continue;
+        }
+        percent += delta;
+        let begin = samples.partition_point(|(at, _)| at <= from);
+        let finish = samples.partition_point(|(at, _)| at <= until);
+        for (_, sample) in &samples[begin..finish] {
+            matched_tokens += sample.token_usage.total.unwrap_or(0.0);
+            if let Some((min, max)) = cost(sample, provider) {
+                matched_low += min;
+                matched_high += max;
+            } else {
+                matched_priced = false;
+            }
+        }
+    }
+    let has_samples = !cycle_samples.is_empty();
+    let has_cost = has_samples && unknown.is_empty();
+    CycleSummary {
+        cache_write_tokens: cycle_samples.iter().map(|sample| sample.cache_write).sum(),
+        start_at: start.to_rfc3339(),
+        end_at: end.to_rfc3339(),
+        token_usage: usage,
+        cost_low_usd: has_cost.then_some(low),
+        cost_high_usd: has_cost.then_some(high),
+        models: models.into_iter().collect(),
+        unknown_price_models: unknown.into_iter().collect(),
+        sample_count: cycle_samples.len(),
+        observed_from: readings.first().map(|(at, _)| at.to_rfc3339()),
+        observed_until: readings.last().map(|(at, _)| at.to_rfc3339()),
+        observed_percent: percent,
+        tokens_per_percent: (percent > 0.0 && matched_tokens > 0.0)
+            .then(|| matched_tokens / percent),
+        cost_per_percent_low: (percent > 0.0 && matched_priced && matched_tokens > 0.0)
+            .then(|| matched_low / percent),
+        cost_per_percent_high: (percent > 0.0 && matched_priced && matched_tokens > 0.0)
+            .then(|| matched_high / percent),
+        quota_drops: drops,
+    }
+}
+
+// 统一按 2026-10-24 官方标准短上下文价格估算，便于跨周期比较；不是订阅扣额公式或实际账单。
+fn cost(sample: &TokenUsageSample, provider: &str) -> Option<(f64, f64)> {
+    let model = sample.model.as_str();
+    let (input_price, cached_price, output_price, write_low, write_high) = if provider == "codex" {
+        let (input, cached, output) = match model {
+            "gpt-6.1-sol" => (2.0, 0.1, 10.0),
+            "gpt-6-sol" => (2.0, 0.2, 10.0),
+            "gpt-6-astra" => (10.0, 1.0, 50.0),
+            "gpt-6-luna" => (0.1, 0.01, 0.5),
+            "gpt-5.6-sol" => (4.0, 0.4, 20.0),
+            "gpt-5.6-terra" => (2.0, 0.2, 12.0),
+            "gpt-5.6-luna" => (0.2, 0.02, 1.2),
+            "gpt-5.5" => (5.0, 0.5, 30.0),
+            "gpt-5.4" => (2.5, 0.25, 15.0),
+            "gpt-5.3-codex" => (1.75, 0.175, 14.0),
+            _ => return None,
+        };
+        (input, cached, output, input * 1.25, input * 2.5)
+    } else {
+        let (input, cached, output) = match model {
+            "claude-opus-5-5" => (4.0, 0.2, 20.0),
+            "claude-sonnet-5-5" => (2.0, 0.1, 10.0),
+            "claude-fable-5-1" | "claude-mythos-5-1" => (10.0, 0.25, 50.0),
+            "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
+            | "claude-opus-4-5" => (5.0, 0.5, 25.0),
+            "claude-sonnet-5" => (2.0, 0.2, 10.0),
+            "claude-sonnet-4-6" | "claude-sonnet-4-5" => (3.0, 0.3, 15.0),
+            "claude-haiku-4-5" => (1.0, 0.1, 5.0),
+            _ => return None,
+        };
+        (input, cached, output, input * 1.25, input * 2.0)
+    };
+    let input = sample.token_usage.input?;
+    let cached = sample.token_usage.cached_input?;
+    let output = sample.token_usage.output?;
+    let uncached = input - cached - sample.cache_write;
+    if uncached < 0.0 {
+        return None;
+    }
+    let base = uncached * input_price + cached * cached_price + output * output_price;
+    Some((
+        (base + sample.cache_write * write_low) / 1_000_000.0,
+        (base + sample.cache_write * write_high) / 1_000_000.0,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample(at: &str) -> TokenUsageSample {
+        TokenUsageSample {
+            timestamp: at.into(),
+            model: "gpt-6.1-sol".into(),
+            cache_write: 0.0,
+            windows: Vec::new(),
+            token_usage: TokenUsage {
+                input: Some(1_000_000.0),
+                cached_input: Some(500_000.0),
+                output: Some(100_000.0),
+                total: Some(1_100_000.0),
+                reasoning_output: None,
+                limit: None,
+            },
+        }
+    }
+
+    #[test]
+    fn uses_model_price_and_counts_cached_input_once() {
+        let mut sample = sample("2026-10-24T01:00:00Z");
+        assert_eq!(cost(&sample, "codex"), Some((2.05, 2.05)));
+        sample.model = "codex-auto-review".into();
+        assert_eq!(cost(&sample, "codex"), None);
+    }
+
+    #[test]
+    fn unknown_cache_ttl_returns_a_price_range() {
+        let mut sample = sample("2026-10-24T01:00:00Z");
+        sample.model = "claude-opus-5-5".into();
+        sample.cache_write = 100_000.0;
+        let (low, high) = cost(&sample, "claude").unwrap();
+        assert!((low - 4.2).abs() < 0.000001);
+        assert!((high - 4.5).abs() < 0.000001);
+    }
+
+    #[test]
+    fn quota_drop_does_not_inflate_observed_capacity() {
+        let end = "2026-10-25T00:00:00Z";
+        let points = [("2026-10-24T00:00:00Z", 10), ("2026-10-24T01:00:00Z", 20), ("2026-10-24T02:00:00Z", 0), ("2026-10-24T03:00:00Z", 10)]
+            .into_iter().map(|(at, used)| serde_json::from_value(json!({"at": at, "windows": [{"id":"weekly","label":"7天","used":used,"total":100,"resetAt":end,"windowDurationMins":10080}]})).unwrap()).collect::<Vec<Observation>>();
+        let records = [
+            sample("2026-10-24T01:00:00Z"),
+            sample("2026-10-24T02:00:00Z"),
+            sample("2026-10-24T03:00:00Z"),
+        ];
+        let timed = records
+            .iter()
+            .map(|sample| {
+                (
+                    DateTime::parse_from_rfc3339(&sample.timestamp)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    sample,
+                )
+            })
+            .collect::<Vec<_>>();
+        let end = DateTime::parse_from_rfc3339(end)
+            .unwrap()
+            .with_timezone(&Utc);
+        let summary = summarize(
+            end - Duration::days(7),
+            end,
+            10080,
+            &points,
+            &timed,
+            "codex",
+        );
+        assert_eq!(summary.sample_count, 3);
+        assert_eq!(summary.quota_drops, 1);
+        assert_eq!(summary.observed_percent, 20.0);
+        assert_eq!(summary.tokens_per_percent, Some(110_000.0));
+    }
+
+    #[test]
+    fn samples_at_reset_time_belong_to_the_next_cycle() {
+        let record = sample("2026-10-24T00:00:00Z");
+        let end = DateTime::parse_from_rfc3339(&record.timestamp)
+            .unwrap()
+            .with_timezone(&Utc);
+        let summary = summarize(
+            end - Duration::days(7),
+            end,
+            10080,
+            &[],
+            &[(end, &record)],
+            "codex",
+        );
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.cost_low_usd, None);
+    }
+}

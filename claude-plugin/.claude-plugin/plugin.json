@@ -1,0 +1,6 @@
+{
+  "name": "codexinfo-usage",
+  "version": "1.0.0",
+  "author": { "name": "CodexInfo" },
+  "description": "将 Claude Code 官方用量读数发送到本机 CodexInfo 桌面组件"
+}

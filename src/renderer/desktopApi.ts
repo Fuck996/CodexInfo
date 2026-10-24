@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings, DesktopApi, UsageSnapshot } from "../shared/types";
+import type { AppSettings, DesktopApi, MonitorOption, UsageSnapshot } from "../shared/types";
 
 declare global {
   interface Window {
@@ -8,8 +8,13 @@ declare global {
 }
 
 const tauriApi: DesktopApi = {
-  getUsageSnapshot: () => invoke<UsageSnapshot>("get_usage_snapshot"),
-  getCachedUsageSnapshot: () => invoke<UsageSnapshot | null>("get_cached_usage_snapshot"),
+  getUsageSnapshot: (provider) => invoke<UsageSnapshot>("get_usage_snapshot", { provider }),
+  getCachedUsageSnapshot: (provider) => invoke<UsageSnapshot | null>("get_cached_usage_snapshot", { provider }),
+  setUsageMode: (mode, intervalSecs) => invoke<AppSettings>("set_usage_mode", { mode, intervalSecs }),
+  getMonitors: () => invoke<MonitorOption[]>("get_monitors"),
+  setSelectedMonitor: (monitorId) => invoke<AppSettings>("set_selected_monitor", { monitorId }),
+  installClaudeBridge: () => invoke<string>("install_claude_bridge"),
+  setSettingsOpen: (open) => invoke<void>("set_settings_open", { open }),
   getSettings: () => invoke<AppSettings>("get_settings"),
   setLaunchAtStartup: (enabled: boolean) => invoke<AppSettings>("set_launch_at_startup", { enabled }),
   setTrayUsageEnabled: (enabled: boolean) => invoke<AppSettings>("set_tray_usage_enabled", { enabled }),
@@ -25,7 +30,16 @@ const unavailableApi: DesktopApi = {
     throw new Error("Tauri 桥接不可用，请使用 npm run tauri:dev 或打包后的程序启动。");
   },
   getCachedUsageSnapshot: async () => null,
+  setUsageMode: async () => { throw new Error("Tauri 桥接不可用"); },
+  getMonitors: async () => [],
+  setSelectedMonitor: async () => { throw new Error("Tauri 桥接不可用"); },
+  installClaudeBridge: async () => { throw new Error("Tauri 桥接不可用"); },
+  setSettingsOpen: async () => undefined,
   getSettings: async () => ({
+    usageMode: "codex",
+    activeProvider: "codex",
+    rotationIntervalSecs: 10,
+    selectedMonitor: null,
     launchAtStartup: false,
     mainVisible: false,
     keepAlwaysOnTop: true,

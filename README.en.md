@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-CodexInfo is a Windows desktop usage widget for Codex. It displays local Codex 5-hour usage, 7-day usage, reset times, reset credits, plan name, Token usage, and estimated API-equivalent cost.
+CodexInfo is a Windows desktop usage widget for Codex and Claude Code. It displays 5-hour and 7-day usage, reset times, Token usage, and estimated API-equivalent cost, with comparisons between actual quota windows.
 
 The UI uses a black translucent glass style, orange highlights, and a pixel-style font. By default, the app only shows a compact taskbar dock. Hovering over the dock opens the full widget above the taskbar; moving the cursor away from both the dock and the widget collapses it automatically.
 
@@ -13,7 +13,9 @@ The UI uses a black translucent glass style, orange highlights, and a pixel-styl
 - Hover widget: opens from the dock, collapses automatically, and remembers the previous expanded state.
 - Reset credits: shows available count, expiring soon, total remaining time, nearest expiration, and per-credit expiration details.
 - Subscription info: displays plan name.
-- Token and API-equivalent cost: Token values support Chinese `万` / `亿` units; clicking the Token area expands weekly and monthly API-equivalent cost.
+- Switch manually between Codex and Claude, or rotate every 5, 10, 30, or 60 seconds. The dock, widget, and tray share the selected source.
+- Choose the display for the dock and widget, including secondary taskbars, negative coordinates, and different scale factors. A disconnected target temporarily uses the primary display and returns when reconnected.
+- Token and API-equivalent cost: compare current and previous quota windows, including cache reads/writes, models, and observed Tokens/cost per percentage point of quota.
 - Tray menu: show widget, keep always on top, show usage in tray, show taskbar entry, launch at startup, and quit.
 - Local cache: shows the last cached data on startup, then refreshes automatically after fresh data is loaded.
 - No fake fallback data: when data cannot be read, the app surfaces the real error instead of showing demo usage, subscription, or reset data.
@@ -43,6 +45,24 @@ CodexInfo reads real local Codex data first:
 - Local Codex session `token_count` events: Token input, cached input, output, and period statistics.
 
 All data comes from the local Codex / ChatGPT login state and local session logs. If no data is available, the app reports the real error instead of displaying mock data.
+
+### Claude Code setup
+
+Open Display settings in CodexInfo and select Connect Claude Code. The app installs a local plugin using the official Claude CLI, including the CLI bundled with Microsoft Store Claude Desktop. Run `/reload-plugins` in an existing Code session or start a new session. A model response supplies the first usage reading. Desktop's bundled Claude Code needs v2.1.286 or later; the terminal CLI needs v2.1.287 or later.
+
+The plugin uses official Mods events: `session.measure` for quota windows and `turn.step` for per-request Tokens/model. It exports only counters, timestamps, session/request identifiers, and models. It does not export messages, tool arguments, or login tokens. Requests are deduplicated by identifier and snapshots are written atomically. Reconnect after moving the portable executable so the plugin uses its new path.
+
+Readings update with Code sessions, rather than independent online polling. Expired windows are removed, missing readings are not replaced with zero, and historical Claude data starts when the plugin is connected. Mods does not currently expose banked reset balances; this limitation is shown explicitly. Existing Codex banked reset balances and expiration details remain available. The widget never redeems resets.
+
+### Comparison and pricing
+
+Cycles use the platform's reset timestamp and window duration instead of calendar weeks/months. Codex statistics include existing active and archived logs, with no 120-file cutoff and metadata caching. The previous window must have been observed; missing history remains unavailable. Statistics cover recorded requests on this machine, excluding unrecorded sessions, other devices, and web usage.
+
+Per-percentage-point statistics match Tokens to the interval between adjacent quota readings. Intervals where usage decreases are excluded; a decrease is recorded without assuming it was a banked reset. Compare model/cache usage and sampling coverage as well as normalized consumption. These observations alone cannot prove a reduction in the provider's limits.
+
+API-equivalent costs use each model's official standard short-context prices as of **2026-10-24** as a fixed comparison basis. Unknown model prices remain unavailable. Cache writes with an unknown TTL produce a price range. This is not the subscription quota formula or an invoice and excludes tool fees and context/speed/region premiums.
+
+Sources: [Claude Mods](https://code.claude.com/docs/en/plugins/mods/overview), [Mods API](https://code.claude.com/docs/en/plugins/mods/reference), [banked resets](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset), [OpenAI pricing](https://developers.openai.com/api/docs/pricing), [Claude pricing](https://platform.claude.com/docs/en/about-claude/pricing).
 
 ## Development
 
@@ -98,4 +118,4 @@ For development and packaging:
 
 ## Privacy
 
-CodexInfo does not upload your Codex session logs. It reads Codex / ChatGPT login information locally and requests usage and reset-credit data from official ChatGPT endpoints.
+CodexInfo does not upload session logs. Codex uses local credentials to request official usage/reset endpoints; Claude exports counters through the local plugin, without CodexInfo reading Claude credentials. Quota observation history stays in the app data directory.

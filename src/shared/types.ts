@@ -1,4 +1,7 @@
 export type ThemeName = "orange" | "green";
+export type UsageProvider = "codex" | "claude";
+export type UsageMode = UsageProvider | "rotate";
+export type MonitorOption = { id: string; label: string };
 
 export type UsageWindow = {
   id: string;
@@ -19,17 +22,6 @@ export type TokenUsage = {
   limit: number | null;
 };
 
-export type TokenPeriodId = "thisWeek" | "lastWeek" | "thisMonth" | "lastMonth";
-
-export type TokenPeriodUsage = {
-  id: TokenPeriodId;
-  label: string;
-  rangeLabel: string;
-  tokenUsage: TokenUsage;
-  computedAt: string;
-  hasData: boolean;
-};
-
 export type ResetChance = {
   id: string;
   label: string;
@@ -41,6 +33,8 @@ export type ResetCredits = {
 };
 
 export type UsageSnapshot = {
+  cycleComparisons?: CycleComparison[];
+  provider: UsageProvider;
   planName: string;
   subscriptionExpiresAt: string;
   windows: UsageWindow[];
@@ -51,12 +45,41 @@ export type UsageSnapshot = {
   resetCredits?: ResetCredits;
   updatedAt: string;
   sourcePath: string;
-  accountSource: "codexAppServer" | "codexAuth" | "usageFile";
+  accountSource: "codexAppServer" | "codexAuth" | "usageFile" | "claudeMod";
   cachedAt?: string;
-  tokenPeriods?: TokenPeriodUsage[];
+};
+
+export type CycleSummary = {
+  cacheWriteTokens: number;
+  startAt: string;
+  endAt: string;
+  tokenUsage: TokenUsage;
+  costLowUsd: number | null;
+  costHighUsd: number | null;
+  models: string[];
+  unknownPriceModels: string[];
+  sampleCount: number;
+  observedFrom: string | null;
+  observedUntil: string | null;
+  observedPercent: number;
+  tokensPerPercent: number | null;
+  costPerPercentLow: number | null;
+  costPerPercentHigh: number | null;
+  quotaDrops: number;
+};
+
+export type CycleComparison = {
+  windowId: string;
+  label: string;
+  current: CycleSummary;
+  previous: CycleSummary | null;
 };
 
 export type AppSettings = {
+  usageMode: UsageMode;
+  activeProvider: UsageProvider;
+  rotationIntervalSecs: number;
+  selectedMonitor: string | null;
   launchAtStartup: boolean;
   mainVisible: boolean;
   keepAlwaysOnTop: boolean;
@@ -67,8 +90,13 @@ export type AppSettings = {
 };
 
 export type DesktopApi = {
-  getUsageSnapshot: () => Promise<UsageSnapshot>;
-  getCachedUsageSnapshot: () => Promise<UsageSnapshot | null>;
+  getUsageSnapshot: (provider: UsageProvider) => Promise<UsageSnapshot>;
+  getCachedUsageSnapshot: (provider: UsageProvider) => Promise<UsageSnapshot | null>;
+  setUsageMode: (mode: UsageMode, intervalSecs: number) => Promise<AppSettings>;
+  getMonitors: () => Promise<MonitorOption[]>;
+  setSelectedMonitor: (monitorId: string | null) => Promise<AppSettings>;
+  installClaudeBridge: () => Promise<string>;
+  setSettingsOpen: (open: boolean) => Promise<void>;
   getSettings: () => Promise<AppSettings>;
   setLaunchAtStartup: (enabled: boolean) => Promise<AppSettings>;
   setTrayUsageEnabled: (enabled: boolean) => Promise<AppSettings>;

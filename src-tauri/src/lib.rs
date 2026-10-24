@@ -1,6 +1,10 @@
 mod diagnostics;
+mod claude;
+mod analytics;
+mod monitors;
+use monitors::{target_monitor, get_monitors, set_selected_monitor};
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use reqwest::{blocking::Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,13 +21,13 @@ use std::{
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use tauri::{
     image::Image,
-    menu::{CheckMenuItem, Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     window::{ProgressBarState, ProgressBarStatus},
     AppHandle, Emitter, Manager, Runtime, WebviewWindow,
@@ -56,12 +60,11 @@ use windows::{
 };
 
 const COLLAPSED_WIDTH: f64 = 460.0;
-const COLLAPSED_HEIGHT: f64 = 430.0;
+const COLLAPSED_HEIGHT: f64 = 470.0;
 const MAX_EXPANDED_HEIGHT: f64 = 920.0;
 const DOCK_TRAY_GAP: f64 = 12.0;
 const DOCK_EDGE_GAP: f64 = 4.0;
 const APP_SERVER_TIMEOUT_MS: u64 = 8_000;
-const MAX_SESSION_FILES_TO_SCAN: usize = 120;
 const CHATGPT_BACKEND_URL: &str = "https://chatgpt.com/backend-api";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 #[cfg(target_os = "windows")]
@@ -69,6 +72,12 @@ static DOCK_Z_ORDER_EVENTS: OnceLock<mpsc::Sender<()>> = OnceLock::new();
 
 #[derive(Clone)]
 struct AppState {
+    claude_usage_cache: Arc<Mutex<HashMap<PathBuf, CachedSessionUsage>>>,
+    analytics_history: Arc<Mutex<analytics::History>>,
+    settings_open: Arc<AtomicBool>,
+    usage_display: Arc<Mutex<UsageDisplay>>,
+    codex_reading: Arc<Mutex<Option<(Instant, Result<UsageSnapshot, String>)>>>,
+    selected_monitor: Arc<Mutex<Option<String>>>,
     keep_always_on_top: Arc<AtomicBool>,
     tray_usage_enabled: Arc<AtomicBool>,
     dock_enabled: Arc<AtomicBool>,
@@ -91,7 +100,7 @@ struct TrayUsageText {
     tooltip: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct UsageWindow {
     id: String,
@@ -121,32 +130,25 @@ struct TokenUsage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct TokenPeriodUsage {
-    id: String,
-    label: String,
-    range_label: String,
-    token_usage: TokenUsage,
-    computed_at: String,
-    has_data: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct ResetChance {
     id: String,
     label: String,
     expires_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ResetCredits {
     available: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct UsageSnapshot {
+    #[serde(default)]
+    cycle_comparisons: Vec<analytics::CycleComparison>,
+    #[serde(default)]
+    provider: UsageProvider,
     plan_name: String,
     subscription_expires_at: String,
     windows: Vec<UsageWindow>,
@@ -161,13 +163,15 @@ struct UsageSnapshot {
     account_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     cached_at: Option<String>,
-    #[serde(default)]
-    token_periods: Vec<TokenPeriodUsage>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
+    usage_mode: UsageMode,
+    active_provider: UsageProvider,
+    rotation_interval_secs: u64,
+    selected_monitor: Option<String>,
     launch_at_startup: bool,
     main_visible: bool,
     keep_always_on_top: bool,
@@ -181,6 +185,9 @@ struct AppSettings {
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 struct StoredSettings {
+    usage_mode: UsageMode,
+    rotation_interval_secs: u64,
+    selected_monitor: Option<String>,
     main_visible: bool,
     keep_always_on_top: bool,
     tray_usage_enabled: bool,
@@ -192,6 +199,9 @@ struct StoredSettings {
 impl Default for StoredSettings {
     fn default() -> Self {
         Self {
+            usage_mode: UsageMode::Codex,
+            rotation_interval_secs: 10,
+            selected_monitor: None,
             main_visible: false,
             keep_always_on_top: true,
             tray_usage_enabled: true,
@@ -199,6 +209,33 @@ impl Default for StoredSettings {
             taskbar_usage_enabled: false,
             theme: "orange".to_string(),
         }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum UsageProvider { #[default] Codex, Claude }
+
+impl UsageProvider {
+    fn label(self) -> &'static str {
+        match self { Self::Codex => "Codex", Self::Claude => "Claude" }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum UsageMode { #[default] Codex, Claude, Rotate }
+
+struct UsageDisplay {
+    mode: UsageMode,
+    provider: UsageProvider,
+    interval_secs: u64,
+    switched_at: Instant,
+}
+
+impl Default for UsageDisplay {
+    fn default() -> Self {
+        Self { mode: UsageMode::Codex, provider: UsageProvider::Codex, interval_secs: 10, switched_at: Instant::now() }
     }
 }
 
@@ -220,6 +257,9 @@ struct TokenCountEvent {
 struct TokenUsageSample {
     timestamp: String,
     token_usage: TokenUsage,
+    model: String,
+    cache_write: f64,
+    windows: Vec<UsageWindow>,
 }
 
 struct SessionUsage {
@@ -238,10 +278,6 @@ fn codex_root() -> Option<PathBuf> {
         Some(path) => Some(PathBuf::from(path)),
         None => dirs::home_dir().map(|home| home.join(".codex")),
     }
-}
-
-fn sessions_path() -> Option<PathBuf> {
-    codex_root().map(|root| root.join("sessions"))
 }
 
 fn auth_path() -> Option<PathBuf> {
@@ -428,85 +464,6 @@ fn token_usage_has_positive_total(usage: &TokenUsage) -> bool {
         || usage.cached_input.unwrap_or(0.0) > 0.0
 }
 
-fn format_period_range(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
-    let end_inclusive = end - ChronoDuration::seconds(1);
-    format!(
-        "{} · {}",
-        start.with_timezone(&Local).format("%Y-%m-%d"),
-        end_inclusive.with_timezone(&Local).format("%Y-%m-%d")
-    )
-}
-
-fn local_midnight_utc(date: NaiveDate) -> Option<DateTime<Utc>> {
-    let midnight = date.and_hms_opt(0, 0, 0)?;
-    Local
-        .from_local_datetime(&midnight)
-        .earliest()
-        .map(|time| time.with_timezone(&Utc))
-}
-
-fn add_months(year: i32, month: u32, offset: i32) -> Option<NaiveDate> {
-    let zero_based = year * 12 + month as i32 - 1 + offset;
-    let next_year = zero_based.div_euclid(12);
-    let next_month = zero_based.rem_euclid(12) as u32 + 1;
-    NaiveDate::from_ymd_opt(next_year, next_month, 1)
-}
-
-fn token_period_ranges() -> Vec<(&'static str, &'static str, DateTime<Utc>, DateTime<Utc>)> {
-    let today = Local::now().date_naive();
-    let week_start = today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
-    let this_month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
-    let last_month_start = add_months(this_month_start.year(), this_month_start.month(), -1)
-        .unwrap_or(this_month_start);
-    let next_month_start = add_months(this_month_start.year(), this_month_start.month(), 1)
-        .unwrap_or(this_month_start);
-
-    [
-        ("thisWeek", "本周", week_start, week_start + ChronoDuration::days(7)),
-        ("lastWeek", "上周", week_start - ChronoDuration::days(7), week_start),
-        ("thisMonth", "本月", this_month_start, next_month_start),
-        ("lastMonth", "上月", last_month_start, this_month_start),
-    ]
-    .into_iter()
-    .filter_map(|(id, label, start, end)| Some((id, label, local_midnight_utc(start)?, local_midnight_utc(end)?)))
-    .collect()
-}
-
-fn build_token_periods(samples: &[TokenUsageSample]) -> Vec<TokenPeriodUsage> {
-    token_period_ranges()
-        .into_iter()
-        .map(|(id, label, start, end)| {
-            let mut token_usage = empty_token_usage();
-            let mut latest_time: Option<DateTime<Utc>> = None;
-            let mut has_data = false;
-
-            for sample in samples {
-                let Some(event_time) = DateTime::parse_from_rfc3339(&sample.timestamp)
-                    .ok()
-                    .map(|time| time.with_timezone(&Utc))
-                else {
-                    continue;
-                };
-                if event_time < start || event_time >= end {
-                    continue;
-                }
-                merge_token_usage(&mut token_usage, &sample.token_usage);
-                latest_time = Some(latest_time.map_or(event_time, |latest| latest.max(event_time)));
-                has_data = true;
-            }
-
-            TokenPeriodUsage {
-                id: id.to_string(),
-                label: label.to_string(),
-                range_label: format_period_range(start, end),
-                token_usage,
-                computed_at: latest_time.unwrap_or_else(Utc::now).to_rfc3339(),
-                has_data,
-            }
-        })
-        .collect()
-}
-
 fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, String> {
     let rate_limits = event
         .payload
@@ -531,6 +488,8 @@ fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, S
         .unwrap_or_else(|| "Codex".to_string());
 
     Ok(UsageSnapshot {
+        cycle_comparisons: Vec::new(),
+        provider: UsageProvider::Codex,
         plan_name,
         subscription_expires_at: String::new(),
         windows,
@@ -550,7 +509,6 @@ fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, S
         source_path: event.source_path.display().to_string(),
         account_source: "usageFile".to_string(),
         cached_at: None,
-        token_periods: Vec::new(),
     })
 }
 
@@ -583,9 +541,19 @@ fn read_session_usage(reader: impl BufRead, path: &Path) -> Result<SessionUsage,
     let mut samples = Vec::new();
     let mut latest = None;
     let mut previous_total: Option<TokenUsage> = None;
+    let mut model = "未知模型".to_string();
+    let mut previous_cache_write = 0.0;
 
     for line in reader.lines() {
         let line = line.map_err(|error| format!("读取会话 {} 失败: {error}", path.display()))?;
+        if !line.contains("\"token_count\"") && !line.contains("\"turn_context\"") { continue; }
+        if line.contains("\"turn_context\"") {
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            if string_field(&value, "type") == Some("turn_context") {
+                if let Some(name) = value.get("payload").and_then(|payload| string_field(payload, "model")) { model = name.to_string(); }
+            }
+        }
+        }
         let Some(event) = parse_token_count_line(&line, path) else {
             continue;
         };
@@ -616,9 +584,16 @@ fn read_session_usage(reader: impl BufRead, path: &Path) -> Result<SessionUsage,
         };
 
         if token_usage_has_positive_total(&usage) {
+            let current_cache_write = info.get("total_token_usage").and_then(|stats| stats.get("cache_write_input_tokens")).and_then(number).unwrap_or(0.0);
+            let cache_write = if current_cache_write >= previous_cache_write { current_cache_write - previous_cache_write } else { current_cache_write };
+            previous_cache_write = current_cache_write;
+            let windows = ["primary", "secondary"].into_iter().filter_map(|slot| {
+                session_window_to_usage(slot, event.payload.get("rate_limits")?.get(slot))
+            }).collect();
             samples.push(TokenUsageSample {
                 timestamp: event.timestamp,
                 token_usage: usage,
+                model: model.clone(), cache_write, windows,
             });
         }
     }
@@ -626,52 +601,49 @@ fn read_session_usage(reader: impl BufRead, path: &Path) -> Result<SessionUsage,
     Ok(SessionUsage { latest, samples })
 }
 
-fn recent_session_files() -> Vec<PathBuf> {
-    let Some(root) = sessions_path() else {
-        return Vec::new();
+fn recent_session_files() -> Result<Vec<PathBuf>, String> {
+    let Some(codex_root) = codex_root() else {
+        return Err("无法确定 Codex 数据目录".into());
     };
-    if !root.exists() {
-        return Vec::new();
+    let roots = [codex_root.join("sessions"), codex_root.join("archived_sessions")];
+
+    let mut candidates = Vec::new();
+    for root in roots.into_iter().filter(|root| root.exists()) {
+        for entry in WalkDir::new(root) {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.file_type().is_file() && entry.path().extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                let modified = entry.metadata().map_err(|error| error.to_string())?.modified().map_err(|error| error.to_string())?;
+                candidates.push((entry.into_path(), modified));
+            }
+        }
     }
 
-    let mut candidates: Vec<_> = WalkDir::new(root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-        .filter_map(|entry| {
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((entry.path().to_path_buf(), modified))
-        })
-        .collect();
-
     candidates.sort_by_key(|(_, modified)| Reverse(*modified));
-    candidates
+    Ok(candidates
         .into_iter()
-        .take(MAX_SESSION_FILES_TO_SCAN)
         .map(|(path, _)| path)
-        .collect()
+        .collect())
+}
+
+fn refresh_usage_file(path: &Path, cache: &mut HashMap<PathBuf, CachedSessionUsage>, parse: impl FnOnce(BufReader<fs::File>, &Path) -> Result<SessionUsage, String>) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("读取用量文件 {} 属性失败: {error}", path.display()))?;
+    let modified = metadata.modified().map_err(|error| error.to_string())?;
+    let length = metadata.len();
+    if cache.get(path).is_some_and(|cached| cached.modified == modified && cached.length == length) { return Ok(()); }
+    let file = fs::File::open(path).map_err(|error| format!("打开用量文件 {} 失败: {error}", path.display()))?;
+    let usage = parse(BufReader::new(file), path)?;
+    cache.insert(path.to_path_buf(), CachedSessionUsage { modified, length, usage });
+    Ok(())
 }
 
 fn find_session_usage(state: &AppState) -> Result<(Vec<TokenCountEvent>, Vec<TokenUsageSample>), String> {
-    let paths = recent_session_files();
+    let paths = recent_session_files()?;
     let mut cache = state.session_usage_cache.lock().map_err(|error| error.to_string())?;
     cache.retain(|path, _| paths.contains(path));
     let mut events = Vec::new();
     let mut samples = Vec::new();
     for path in paths {
-        let metadata = fs::metadata(&path).map_err(|error| format!("读取会话 {} 属性失败: {error}", path.display()))?;
-        let modified = metadata.modified().map_err(|error| error.to_string())?;
-        let length = metadata.len();
-        let unchanged = cache.get(&path)
-            .map(|cached| cached.modified == modified && cached.length == length)
-            .unwrap_or(false);
-        if !unchanged {
-            cache.remove(&path);
-            let file = fs::File::open(&path).map_err(|error| format!("打开会话 {} 失败: {error}", path.display()))?;
-            let usage = read_session_usage(BufReader::new(file), &path)?;
-            cache.insert(path.clone(), CachedSessionUsage { modified, length, usage });
-        }
+        refresh_usage_file(&path, &mut cache, read_session_usage)?;
         if let Some(cached) = cache.get(&path) {
             events.extend(cached.usage.latest.iter().cloned());
             samples.extend(cached.usage.samples.iter().cloned());
@@ -1178,6 +1150,20 @@ fn tray_notify_rect() -> Option<RECT> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn taskbar_windows() -> Vec<HWND> {
+    let mut windows = Vec::new();
+    unsafe {
+        if let Ok(primary) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) { windows.push(primary); }
+        let mut previous = None;
+        while let Ok(secondary) = FindWindowExW(None, previous, w!("Shell_SecondaryTrayWnd"), PCWSTR::null()) {
+            windows.push(secondary);
+            previous = Some(secondary);
+        }
+    }
+    windows
+}
+
 #[cfg(not(target_os = "windows"))]
 fn tray_notify_rect() -> Option<()> {
     None
@@ -1189,10 +1175,10 @@ fn read_taskbar_controls() -> windows::core::Result<Vec<RECT>> {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
         let result = (|| -> windows::core::Result<Vec<RECT>> {
             let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-            let hwnd = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null())?;
+            let mut controls = Vec::new();
+            for hwnd in taskbar_windows() {
             let taskbar = automation.ElementFromHandle(hwnd)?;
             let elements = taskbar.FindAll(TreeScope_Descendants, &automation.CreateTrueCondition()?)?;
-            let mut controls = Vec::new();
             for index in 0..elements.Length()? {
                 let element = elements.GetElement(index)?;
                 let control_type = element.CurrentControlType()?;
@@ -1206,6 +1192,7 @@ fn read_taskbar_controls() -> windows::core::Result<Vec<RECT>> {
                     }
                 }
             }
+            }
             Ok(controls)
         })();
         CoUninitialize();
@@ -1216,26 +1203,31 @@ fn read_taskbar_controls() -> windows::core::Result<Vec<RECT>> {
 #[cfg(target_os = "windows")]
 fn dock_position(app: &AppHandle, state: &AppState) -> Option<tauri::PhysicalPosition<f64>> {
     let window = app.get_webview_window("dock")?;
+    let monitor = target_monitor(app)?;
     let size = window.outer_size().ok()?;
-    let scale = window.scale_factor().ok()?;
-    let tray = tray_notify_rect()?;
-    let mut taskbar = RECT::default();
-    unsafe {
-        let hwnd = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
-        GetWindowRect(hwnd, &mut taskbar).ok()?;
-    }
+    let scale = monitor.scale_factor();
+    let width = size.width as f64 / window.scale_factor().ok()? * scale;
+    let height = size.height as f64 / window.scale_factor().ok()? * scale;
+    let taskbar = taskbar_windows().into_iter().find_map(|hwnd| {
+        let mut bounds = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut bounds).ok()?; }
+        let origin = monitor.position();
+        let right = origin.x + monitor.size().width as i32;
+        let bottom = origin.y + monitor.size().height as i32;
+        (bounds.left >= origin.x && bounds.top >= origin.y && bounds.right <= right && bounds.bottom <= bottom).then_some(bounds)
+    });
+    let tray = tray_notify_rect().filter(|tray| taskbar.is_some_and(|bar| tray.left >= bar.left && tray.right <= bar.right && tray.top >= bar.top && tray.bottom <= bar.bottom));
     let controls = state.taskbar_controls.lock().ok()?;
     let gap = DOCK_TRAY_GAP * scale;
-    if let Some(position) = taskbar_dock_position(taskbar, tray, size.width as f64, size.height as f64, gap, controls.as_ref()?) {
+    if let Some(position) = taskbar.and_then(|taskbar| taskbar_dock_position(taskbar, tray, width, height, gap, controls.as_ref()?)) {
         return Some(position);
     }
-    let monitor = app.primary_monitor().ok().flatten()?;
     let work = monitor.work_area();
-    let x = work.position.x as f64 + gap;
-    let y = if taskbar.bottom <= work.position.y {
+    let x = work.position.x as f64 + work.size.width as f64 - width - gap;
+    let y = if taskbar.is_some_and(|bar| bar.bottom <= work.position.y) {
         work.position.y as f64 + gap
     } else {
-        work.position.y as f64 + work.size.height as f64 - size.height as f64 - gap
+        work.position.y as f64 + work.size.height as f64 - height - gap
     };
     Some(tauri::PhysicalPosition::new(x, y))
 }
@@ -1243,7 +1235,7 @@ fn dock_position(app: &AppHandle, state: &AppState) -> Option<tauri::PhysicalPos
 #[cfg(target_os = "windows")]
 fn taskbar_dock_position(
     taskbar: RECT,
-    tray: RECT,
+    tray: Option<RECT>,
     width: f64,
     height: f64,
     gap: f64,
@@ -1254,16 +1246,16 @@ fn taskbar_dock_position(
     }
     let (x, y) = if taskbar.right - taskbar.left >= taskbar.bottom - taskbar.top {
         (
-            tray.left as f64 - width - gap,
+            tray.map(|tray| tray.left).unwrap_or(taskbar.right) as f64 - width - gap,
             (taskbar.top as f64 + taskbar.bottom as f64 - height) / 2.0,
         )
     } else {
         (
             (taskbar.left as f64 + taskbar.right as f64 - width) / 2.0,
-            tray.top as f64 - height - gap,
+            tray.map(|tray| tray.top).unwrap_or(taskbar.bottom) as f64 - height - gap,
         )
     };
-    let overlaps = |x: f64, y: f64| controls.iter().chain(std::iter::once(&tray)).any(|rect| {
+    let overlaps = |x: f64, y: f64| controls.iter().chain(tray.iter()).any(|rect| {
         x < rect.right as f64 + gap && x + width + gap > rect.left as f64
             && y < rect.bottom as f64 && y + height > rect.top as f64
     });
@@ -1279,7 +1271,7 @@ fn taskbar_dock_position(
         candidates.sort_by(f64::total_cmp);
         candidates.into_iter()
             .find(|candidate| *candidate >= taskbar.left as f64 + gap
-                && *candidate + width + gap <= tray.left as f64 && !overlaps(*candidate, y))
+                && *candidate + width + gap <= tray.map(|tray| tray.left).unwrap_or(taskbar.right) as f64 && !overlaps(*candidate, y))
             .map(|candidate| tauri::PhysicalPosition::new(candidate, y))
     } else {
         let mut candidates = vec![taskbar.top as f64 + gap];
@@ -1287,7 +1279,7 @@ fn taskbar_dock_position(
         candidates.sort_by(f64::total_cmp);
         candidates.into_iter()
             .find(|candidate| *candidate >= taskbar.top as f64 + gap
-                && *candidate + height + gap <= tray.top as f64 && !overlaps(x, *candidate))
+                && *candidate + height + gap <= tray.map(|tray| tray.top).unwrap_or(taskbar.bottom) as f64 && !overlaps(x, *candidate))
             .map(|candidate| tauri::PhysicalPosition::new(x, candidate))
     }
 }
@@ -1297,14 +1289,23 @@ mod dock_position_tests {
     use super::*;
 
     #[test]
+    fn secondary_taskbar_uses_its_own_bounds_without_a_tray() {
+        let taskbar = RECT { left: -1920, top: 1032, right: 0, bottom: 1080 };
+        let apps = RECT { left: -1100, top: 1032, right: -600, bottom: 1080 };
+        let position = taskbar_dock_position(taskbar, None, 250.0, 42.0, 12.0, &[apps]).unwrap();
+        assert_eq!(position.x, -262.0);
+        assert_eq!(position.y, 1035.0);
+    }
+
+    #[test]
     fn crowded_taskbar_moves_to_leftmost_free_region() {
         let taskbar = RECT { left: 0, top: 1516, right: 2560, bottom: 1600 };
         let tray = RECT { left: 2145, top: 1516, right: 2560, bottom: 1600 };
         let apps = RECT { left: 663, top: 1516, right: 1897, bottom: 1600 };
-        let position = taskbar_dock_position(taskbar, tray, 438.0, 74.0, 21.0, &[apps]).unwrap();
+        let position = taskbar_dock_position(taskbar, Some(tray), 438.0, 74.0, 21.0, &[apps]).unwrap();
         assert_eq!((position.x, position.y), (21.0, 1521.0));
         let widgets = RECT { left: 0, top: 1516, right: 100, bottom: 1600 };
-        let position = taskbar_dock_position(taskbar, tray, 438.0, 74.0, 21.0, &[apps, widgets]).unwrap();
+        let position = taskbar_dock_position(taskbar, Some(tray), 438.0, 74.0, 21.0, &[apps, widgets]).unwrap();
         assert_eq!(position.x, 121.0);
     }
 
@@ -1313,11 +1314,11 @@ mod dock_position_tests {
         let taskbar = RECT { left: -2560, top: 1516, right: 0, bottom: 1600 };
         let tray = RECT { left: -415, top: 1516, right: 0, bottom: 1600 };
         let mut apps = RECT { left: -1800, top: 1516, right: -1100, bottom: 1600 };
-        let position = taskbar_dock_position(taskbar, tray, 438.0, 74.0, 21.0, &[apps]).unwrap();
+        let position = taskbar_dock_position(taskbar, Some(tray), 438.0, 74.0, 21.0, &[apps]).unwrap();
         assert_eq!(position.x, -874.0);
         apps.left = -2560;
         apps.right = -415;
-        assert!(taskbar_dock_position(taskbar, tray, 438.0, 74.0, 21.0, &[apps]).is_none());
+        assert!(taskbar_dock_position(taskbar, Some(tray), 438.0, 74.0, 21.0, &[apps]).is_none());
     }
 
     #[test]
@@ -1328,7 +1329,7 @@ mod dock_position_tests {
                 let tray = RECT { left: 3000, top, right: 3840, bottom: taskbar.bottom };
                 let width = (250.0_f64 * scale).round();
                 let height = (42.0_f64 * scale).round();
-                let position = taskbar_dock_position(taskbar, tray, width, height, 12.0 * scale, &[]).unwrap();
+                let position = taskbar_dock_position(taskbar, Some(tray), width, height, 12.0 * scale, &[]).unwrap();
                 let center = position.y.round() + height / 2.0;
                 assert!((center - (taskbar.top + taskbar.bottom) as f64 / 2.0).abs() <= 0.5);
                 assert!(position.x.round() + width <= tray.left as f64 - 12.0 * scale + 0.5);
@@ -1340,10 +1341,10 @@ mod dock_position_tests {
     fn uses_actual_size_and_tracks_tray_expansion() {
         let taskbar = RECT { left: -1920, top: 1032, right: 0, bottom: 1080 };
         let mut tray = RECT { left: -300, top: 1032, right: 0, bottom: 1080 };
-        let first = taskbar_dock_position(taskbar, tray, 320.0, 44.0, 12.0, &[]).unwrap();
+        let first = taskbar_dock_position(taskbar, Some(tray), 320.0, 44.0, 12.0, &[]).unwrap();
         assert_eq!((first.x, first.y), (-632.0, 1034.0));
         tray.left -= 120;
-        let expanded = taskbar_dock_position(taskbar, tray, 320.0, 44.0, 12.0, &[]).unwrap();
+        let expanded = taskbar_dock_position(taskbar, Some(tray), 320.0, 44.0, 12.0, &[]).unwrap();
         assert_eq!(expanded.x, first.x - 120.0);
         assert_eq!(expanded.x + 320.0 + 12.0, tray.left as f64);
     }
@@ -1351,7 +1352,7 @@ mod dock_position_tests {
 
 #[cfg(not(target_os = "windows"))]
 fn dock_position(app: &AppHandle, _: &AppState) -> Option<tauri::PhysicalPosition<f64>> {
-    let monitor = app.primary_monitor().ok().flatten()?;
+    let monitor = target_monitor(app)?;
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
     let work_area = monitor.work_area();
@@ -1501,7 +1502,8 @@ fn dock_is_above_taskbar(window: &WebviewWindow) -> bool {
 #[cfg(target_os = "windows")]
 fn dock_hwnd_is_above_taskbar(hwnd: HWND) -> bool {
     unsafe {
-        let Ok(taskbar) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) else {
+        let dock_monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let Some(taskbar) = taskbar_windows().into_iter().find(|taskbar| MonitorFromWindow(*taskbar, MONITOR_DEFAULTTONEAREST) == dock_monitor) else {
             return false;
         };
         let mut current = taskbar;
@@ -1723,7 +1725,7 @@ fn watched_shell_window(hwnd: HWND) -> bool {
 
     matches!(
         String::from_utf16_lossy(&class_name[..len as usize]).as_str(),
-        "Shell_TrayWnd" | "TrayNotifyWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland"
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "TrayNotifyWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland"
     )
 }
 
@@ -1802,6 +1804,7 @@ fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
         let callback_app = app.clone();
         let callback_state = state.clone();
         let _ = app.run_on_main_thread(move || {
+            advance_usage_rotation(&callback_app, &callback_state);
             update_dock_window(&callback_app, &callback_state, false);
         });
     });
@@ -1809,9 +1812,7 @@ fn start_dock_z_order_maintenance(app: &AppHandle, state: AppState) {
 
 #[cfg(target_os = "windows")]
 fn dock_is_clear_of_taskbar_controls(window: &WebviewWindow, scale_factor: f64, state: &AppState) -> bool {
-    let Some(tray) = tray_notify_rect() else {
-        return false;
-    };
+    let tray = tray_notify_rect();
     let Ok(position) = window.outer_position() else {
         return false;
     };
@@ -1830,7 +1831,7 @@ fn dock_is_clear_of_taskbar_controls(window: &WebviewWindow, scale_factor: f64, 
     let Some(controls) = controls.as_ref() else {
         return false;
     };
-    controls.iter().chain(std::iter::once(&tray)).all(|rect| {
+    controls.iter().chain(tray.iter()).all(|rect| {
         dock_bottom <= rect.top || dock_top >= rect.bottom
             || dock_right + gap <= rect.left || dock_left >= rect.right + gap
     })
@@ -1907,6 +1908,15 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
             show_dock_window(&window);
         }
         update_dock_z_order(&window, state);
+        if state.hover_component_visible.load(Ordering::Relaxed) {
+            if let Some(main) = app.get_webview_window("main") { position_hover_component(app, &main); }
+        }
+        if let Some(main) = app.get_webview_window("main") {
+            if main.is_visible().unwrap_or(false) && main.current_monitor().ok().flatten().zip(target_monitor(app))
+                .is_some_and(|(current, target)| current.name() != target.name()) {
+                position_hover_component(app, &main);
+            }
+        }
     } else if visible {
         let _ = window.hide();
         state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
@@ -1915,6 +1925,7 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
 
 fn set_latest_tray_usage(app: &AppHandle, snapshot: &UsageSnapshot) {
     let state = app.state::<AppState>();
+    if state.usage_display.lock().map(|display| display.provider != snapshot.provider).unwrap_or(true) { return; }
     if let Ok(mut usage) = state.latest_tray_usage.lock() {
         *usage = build_tray_usage_text(snapshot);
     }
@@ -1987,6 +1998,8 @@ fn snapshot_from_app_server(app_server: Value, session_token: Option<TokenUsage>
     });
 
     let snapshot = UsageSnapshot {
+        cycle_comparisons: Vec::new(),
+        provider: UsageProvider::Codex,
         plan_name: plan,
         subscription_expires_at,
         windows,
@@ -1999,7 +2012,6 @@ fn snapshot_from_app_server(app_server: Value, session_token: Option<TokenUsage>
         source_path: "codex app-server".to_string(),
         account_source: "codexAppServer".to_string(),
         cached_at: None,
-        token_periods: Vec::new(),
     };
 
     Some(DiscoveredSnapshot {
@@ -2047,7 +2059,10 @@ fn read_explicit_snapshot(app: &AppHandle) -> Option<DiscoveredSnapshot> {
 }
 
 #[tauri::command]
-fn get_cached_usage_snapshot(app: AppHandle) -> Result<Option<UsageSnapshot>, String> {
+fn get_cached_usage_snapshot(app: AppHandle, provider: UsageProvider) -> Result<Option<UsageSnapshot>, String> {
+    if provider == UsageProvider::Claude {
+        return claude::read_snapshot(&app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings")).map(Some);
+    }
     let path = usage_cache_path(&app)?;
     if !path.exists() {
         return Ok(None);
@@ -2059,8 +2074,28 @@ fn get_cached_usage_snapshot(app: AppHandle) -> Result<Option<UsageSnapshot>, St
 }
 
 #[tauri::command]
-async fn get_usage_snapshot(app: AppHandle) -> Result<UsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || get_usage_snapshot_blocking(app))
+async fn get_usage_snapshot(app: AppHandle, provider: UsageProvider) -> Result<UsageSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = if provider == UsageProvider::Claude {
+            let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
+            let mut snapshot = claude::read_snapshot(&root.join("claude-readings"))?;
+            let state = app.state::<AppState>();
+            let mut token_cache = state.claude_usage_cache.lock().map_err(|error| error.to_string())?;
+            let samples = claude::token_samples(&root.join("claude-readings"), &mut token_cache)?;
+            let mut history = state.analytics_history.lock().map_err(|error| error.to_string())?;
+            analytics::enrich(&root, &mut history, &mut snapshot, &samples)?;
+            snapshot
+        } else {
+            let state = app.state::<AppState>();
+            let mut cached = state.codex_reading.lock().map_err(|error| error.to_string())?;
+            if cached.as_ref().is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(60)) {
+                *cached = Some((Instant::now(), get_usage_snapshot_blocking(app.clone())));
+            }
+            cached.as_ref().expect("Codex reading initialized").1.clone()?
+        };
+        set_latest_tray_usage(&app, &snapshot);
+        Ok(snapshot)
+    })
         .await
         .map_err(|error| format!("用量读取任务失败: {error}"))?
 }
@@ -2091,15 +2126,16 @@ fn get_usage_snapshot_blocking(app: AppHandle) -> Result<UsageSnapshot, String> 
     let mut snapshot = discovered.snapshot;
     snapshot.source_path = discovered.source_path;
     snapshot.account_source = discovered.account_source;
-    if snapshot.token_periods.is_empty() {
-        snapshot.token_periods = build_token_periods(&token_samples);
-    }
     if snapshot.account_source == "codexAppServer" {
         let (reset_credits, resets) = fetch_reset_credits_from_chatgpt()
             .map_err(|error| format!("读取重置机会失败: {error}"))?;
         snapshot.reset_credits = reset_credits;
         snapshot.resets = resets;
     }
+    let state = app.state::<AppState>();
+    let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let mut history = state.analytics_history.lock().map_err(|error| error.to_string())?;
+    analytics::enrich(&root, &mut history, &mut snapshot, &token_samples)?;
     write_usage_cache(&app, &snapshot)?;
     set_latest_tray_usage(&app, &snapshot);
     Ok(snapshot)
@@ -2114,6 +2150,10 @@ fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
     let stored = read_stored_settings(&app)?;
     let dock_enabled = stored.dock_enabled || stored.taskbar_usage_enabled;
     Ok(AppSettings {
+        usage_mode: stored.usage_mode,
+        active_provider: app.state::<AppState>().usage_display.lock().map_err(|error| error.to_string())?.provider,
+        rotation_interval_secs: stored.rotation_interval_secs,
+        selected_monitor: stored.selected_monitor,
         launch_at_startup,
         main_visible: stored.main_visible,
         keep_always_on_top: stored.keep_always_on_top,
@@ -2126,6 +2166,57 @@ fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
             "orange".to_string()
         },
     })
+}
+
+#[tauri::command]
+fn set_usage_mode(app: AppHandle, mode: UsageMode, interval_secs: u64) -> Result<AppSettings, String> {
+    if ![5, 10, 30, 60].contains(&interval_secs) {
+        return Err("轮播间隔必须为 5、10、30 或 60 秒".into());
+    }
+    let mut stored = read_stored_settings(&app)?;
+    stored.usage_mode = mode;
+    stored.rotation_interval_secs = interval_secs;
+    write_stored_settings(&app, &stored)?;
+    let state = app.state::<AppState>();
+    {
+        let mut display = state.usage_display.lock().map_err(|error| error.to_string())?;
+        display.mode = mode;
+        display.interval_secs = interval_secs;
+        display.switched_at = Instant::now();
+        display.provider = match mode {
+            UsageMode::Codex => UsageProvider::Codex,
+            UsageMode::Claude => UsageProvider::Claude,
+            UsageMode::Rotate => display.provider,
+        };
+    }
+    notify_usage_display(&app, &state);
+    get_settings(app)
+}
+
+fn notify_usage_display(app: &AppHandle, state: &AppState) {
+    if let Ok(mut usage) = state.latest_tray_usage.lock() { *usage = None; }
+    update_tray_display(app, state);
+    if let Ok(settings) = get_settings(app.clone()) { let _ = app.emit("usage-display-changed", &settings); }
+    refresh_tray_menu(app);
+}
+
+fn advance_usage_rotation(app: &AppHandle, state: &AppState) {
+    let changed = if let Ok(mut display) = state.usage_display.lock() {
+        if display.mode == UsageMode::Rotate && display.switched_at.elapsed() >= Duration::from_secs(display.interval_secs) {
+            display.provider = match display.provider { UsageProvider::Codex => UsageProvider::Claude, UsageProvider::Claude => UsageProvider::Codex };
+            display.switched_at = Instant::now();
+            true
+        } else { false }
+    } else { false };
+    if changed { notify_usage_display(app, state); }
+}
+
+#[tauri::command]
+async fn install_claude_bridge(app: AppHandle) -> Result<String, String> {
+    let directory = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || claude::install(&directory, &executable))
+        .await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2263,6 +2354,13 @@ fn set_hover_region(app: AppHandle, region: String, active: bool) -> Result<(), 
     Ok(())
 }
 
+#[tauri::command]
+fn set_settings_open(app: AppHandle, open: bool) {
+    let state = app.state::<AppState>();
+    state.settings_open.store(open, Ordering::Relaxed);
+    if !open { hide_hover_component_if_idle(app.clone(), state.inner().clone()); }
+}
+
 fn show_window<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.unminimize();
     let _ = window.show();
@@ -2279,7 +2377,7 @@ fn hide_main_component(app: &AppHandle, state: &AppState) {
 }
 
 fn hover_component_position(app: &AppHandle, window: &WebviewWindow) -> Option<tauri::PhysicalPosition<i32>> {
-    let monitor = app.primary_monitor().ok().flatten()?;
+    let monitor = target_monitor(app)?;
     let work_area = monitor.work_area();
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
@@ -2383,6 +2481,7 @@ fn start_hover_monitor(app: AppHandle, state: AppState) {
             if !state.hover_component_visible.load(Ordering::Relaxed) {
                 break;
             }
+            if state.settings_open.load(Ordering::Relaxed) { continue; }
             if cursor_inside_hover_area(&app) {
                 continue;
             }
@@ -2397,28 +2496,11 @@ fn hide_hover_component_if_idle(app: AppHandle, state: AppState) {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(180));
         let hover_owned = state.hover_component_visible.load(Ordering::Relaxed);
-        if cursor_inside_hover_area(&app) || !hover_owned {
+        if cursor_inside_hover_area(&app) || !hover_owned || state.settings_open.load(Ordering::Relaxed) {
             return;
         }
         hide_main_component(&app, &state);
     });
-}
-
-fn show_window_near_tray<R: Runtime>(window: &WebviewWindow<R>, position: tauri::PhysicalPosition<f64>) {
-    let scale_factor = window.scale_factor().unwrap_or(1.0);
-    let size = window.outer_size().ok();
-    let width = size
-        .as_ref()
-        .map(|size| size.width as f64)
-        .unwrap_or(COLLAPSED_WIDTH * scale_factor);
-    let height = size
-        .as_ref()
-        .map(|size| size.height as f64)
-        .unwrap_or(COLLAPSED_HEIGHT * scale_factor);
-    let x = (position.x - width + 24.0 * scale_factor).max(0.0);
-    let y = (position.y - height - 12.0 * scale_factor).max(0.0);
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-    show_window(window);
 }
 
 fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
@@ -2475,9 +2557,28 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )?;
     let startup_item = CheckMenuItem::with_id(app, "startup", "开机启动", true, startup_checked, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let sources = Submenu::with_id(app, "sources", "显示用量", true)?;
+    for (id, text, mode) in [("source_codex", "Codex", UsageMode::Codex), ("source_claude", "Claude", UsageMode::Claude), ("source_rotate", "自动轮播", UsageMode::Rotate)] {
+        sources.append(&CheckMenuItem::with_id(app, id, text, true, stored_settings.usage_mode == mode, None::<&str>)?)?;
+    }
+    let intervals = Submenu::with_id(app, "intervals", "轮播间隔", true)?;
+    for seconds in [5, 10, 30, 60] {
+        intervals.append(&CheckMenuItem::with_id(app, format!("interval_{seconds}"), format!("每 {seconds} 秒"), true, stored_settings.rotation_interval_secs == seconds, None::<&str>)?)?;
+    }
+    let monitors_menu = Submenu::with_id(app, "monitors", "显示在哪个屏幕", true)?;
+    monitors_menu.append(&CheckMenuItem::with_id(app, "monitor_primary", "跟随主屏", true, stored_settings.selected_monitor.is_none(), None::<&str>)?)?;
+    if let Ok(monitors) = get_monitors(app.clone()) {
+        for monitor in monitors {
+            monitors_menu.append(&CheckMenuItem::with_id(app, format!("monitor_id:{}", monitor.id), &monitor.label, true,
+                stored_settings.selected_monitor.as_ref() == Some(&monitor.id), None::<&str>)?)?;
+        }
+    }
     Menu::with_items(
         app,
         &[
+            &sources,
+            &intervals,
+            &monitors_menu,
             &visible_item,
             &top_item,
             &tray_usage_item,
@@ -2499,6 +2600,18 @@ fn refresh_tray_menu(app: &AppHandle) {
 }
 
 fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
+    let setting_result = if let Some(provider) = id.strip_prefix("source_") {
+        let mode = match provider { "codex" => UsageMode::Codex, "claude" => UsageMode::Claude, "rotate" => UsageMode::Rotate, _ => return };
+        Some(read_stored_settings(app).and_then(|settings| set_usage_mode(app.clone(), mode, settings.rotation_interval_secs)))
+    } else if let Some(seconds) = id.strip_prefix("interval_") {
+        Some(seconds.parse::<u64>().map_err(|error| error.to_string()).and_then(|interval| read_stored_settings(app).and_then(|settings| set_usage_mode(app.clone(), settings.usage_mode, interval))))
+    } else if id == "monitor_primary" {
+        Some(set_selected_monitor(app.clone(), None))
+    } else { id.strip_prefix("monitor_id:").map(|name| set_selected_monitor(app.clone(), Some(name.to_string()))) };
+    if let Some(result) = setting_result {
+        if let Err(error) = result { let _ = app.emit("settings-error", error); }
+        return;
+    }
     match id {
         "visible" => {
             if let Some(window) = app.get_webview_window("main") {
@@ -2595,71 +2708,7 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
     state
         .taskbar_usage_enabled
         .store(false, Ordering::Relaxed);
-    let visible_item = CheckMenuItem::with_id(
-        app,
-        "visible",
-        "显示组件",
-        true,
-        stored_settings.main_visible,
-        None::<&str>,
-    )?;
-    let top_item = CheckMenuItem::with_id(
-        app,
-        "top",
-        "保持置顶",
-        true,
-        stored_settings.keep_always_on_top,
-        None::<&str>,
-    )?;
-    let tray_usage_item = CheckMenuItem::with_id(
-        app,
-        "tray_usage",
-        "托盘显示用量",
-        true,
-        stored_settings.tray_usage_enabled,
-        None::<&str>,
-    )?;
-    let taskbar_usage_item = CheckMenuItem::with_id(
-        app,
-        "taskbar_usage",
-        "显示任务栏入口",
-        true,
-        dock_enabled,
-        None::<&str>,
-    )?;
-    let startup_checked = app.autolaunch().is_enabled().unwrap_or(false);
-    let orange_theme_item = CheckMenuItem::with_id(
-        app,
-        "theme_orange",
-        "\u{4e3b}\u{9898}\u{ff1a}\u{6a59}\u{8272}",
-        true,
-        stored_settings.theme != "green",
-        None::<&str>,
-    )?;
-    let green_theme_item = CheckMenuItem::with_id(
-        app,
-        "theme_green",
-        "\u{4e3b}\u{9898}\u{ff1a}\u{7eff}\u{8272}",
-        true,
-        stored_settings.theme == "green",
-        None::<&str>,
-    )?;
-    let startup_item =
-        CheckMenuItem::with_id(app, "startup", "开机启动", true, startup_checked, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &visible_item,
-            &top_item,
-            &tray_usage_item,
-            &taskbar_usage_item,
-            &orange_theme_item,
-            &green_theme_item,
-            &startup_item,
-            &quit_item,
-        ],
-    )?;
+    let menu = build_app_menu(app)?;
     let icon = Image::from_bytes(include_bytes!("../icons/icon.png"))?;
     let tray_state = state.clone();
 
@@ -2670,7 +2719,7 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_tray_icon_event(move |tray, event| {
             if let TrayIconEvent::Click {
-                position,
+                position: _,
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
@@ -2681,7 +2730,8 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
                     if window.is_visible().unwrap_or(false) {
                         hide_main_component(app, &tray_state);
                     } else {
-                        show_window_near_tray(&window, position);
+                        position_hover_component(app, &window);
+                        show_window(&window);
                         update_dock_window(app, &tray_state, true);
                     }
                 }
@@ -2696,7 +2746,14 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if claude::handle_cli() { return; }
     let state = AppState {
+        claude_usage_cache: Arc::new(Mutex::new(HashMap::new())),
+        analytics_history: Arc::new(Mutex::new(analytics::History::default())),
+        settings_open: Arc::new(AtomicBool::new(false)),
+        usage_display: Arc::new(Mutex::new(UsageDisplay::default())),
+        codex_reading: Arc::new(Mutex::new(None)),
+        selected_monitor: Arc::new(Mutex::new(None)),
         keep_always_on_top: Arc::new(AtomicBool::new(true)),
         tray_usage_enabled: Arc::new(AtomicBool::new(true)),
         dock_enabled: Arc::new(AtomicBool::new(true)),
@@ -2730,6 +2787,11 @@ pub fn run() {
             get_cached_usage_snapshot,
             get_usage_snapshot,
             get_settings,
+            set_usage_mode,
+            monitors::get_monitors,
+            monitors::set_selected_monitor,
+            set_settings_open,
+            install_claude_bridge,
             set_launch_at_startup,
             set_tray_usage_enabled,
             set_dock_enabled,
@@ -2752,6 +2814,13 @@ pub fn run() {
             }
             create_tray(app.handle(), state.clone())?;
             let stored_settings = read_stored_settings(app.handle()).unwrap_or_default();
+            {
+                let mut display = state.usage_display.lock().map_err(|error| error.to_string())?;
+                display.mode = stored_settings.usage_mode;
+                display.interval_secs = stored_settings.rotation_interval_secs;
+                display.provider = if stored_settings.usage_mode == UsageMode::Claude { UsageProvider::Claude } else { UsageProvider::Codex };
+            }
+            *state.selected_monitor.lock().map_err(|error| error.to_string())? = stored_settings.selected_monitor;
             let dock_enabled = stored_settings.dock_enabled || stored_settings.taskbar_usage_enabled;
             let show_main_on_startup = stored_settings.main_visible && !dock_enabled;
             if let Some(window) = app.get_webview_window("main") {

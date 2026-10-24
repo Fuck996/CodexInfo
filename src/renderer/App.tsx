@@ -1,30 +1,19 @@
-﻿import { ChevronDown, ChevronUp, Database } from "lucide-react";
+import { ChevronDown, ChevronUp } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ThemeName, TokenPeriodId, TokenPeriodUsage, TokenUsage, UsageSnapshot, UsageWindow } from "../shared/types";
+import { useEffect, useMemo, useState } from "react";
+import type { AppSettings, ThemeName, UsageMode, UsageProvider, UsageSnapshot, UsageWindow } from "../shared/types";
 import { desktopApi } from "./desktopApi";
+import { Settings2 } from "lucide-react";
+import { DisplaySettings } from "./DisplaySettings";
+import { UsageAnalytics } from "./UsageAnalytics";
 import dockIcon from "./assets/dock-icon.png";
 
-const refreshIntervalMs = 60_000;
-const apiCostPanelExtraHeight = 180;
+const refreshIntervalMs = 5_000;
+const apiCostPanelExtraHeight = 330;
 const resetDetailBaseExtraHeight = 130;
 const resetDetailRowExtraHeight = 42;
 const numberFormatter = new Intl.NumberFormat("zh-CN");
-const moneyFormatter = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "USD",
-  minimumFractionDigits: 4,
-  maximumFractionDigits: 4
-});
-type ApiCostPeriod = TokenPeriodId;
-
-const apiCostPeriods: Array<{ id: ApiCostPeriod; label: string }> = [
-  { id: "thisWeek", label: "本周" },
-  { id: "lastWeek", label: "上周" },
-  { id: "thisMonth", label: "本月" },
-  { id: "lastMonth", label: "上月" }
-];
 const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
   day: "2-digit",
@@ -68,10 +57,6 @@ function formatToken(value: number | null | undefined) {
   return numberFormatter.format(value);
 }
 
-function tokenText(value: number | null | undefined) {
-  return formatToken(value);
-}
-
 function trimFixed(value: number, fractionDigits: number) {
   return value
     .toFixed(fractionDigits)
@@ -81,21 +66,6 @@ function trimFixed(value: number, fractionDigits: number) {
 
 function setHoverRegion(region: "main" | "dock", active: boolean) {
   void desktopApi.setHoverRegion(region, active);
-}
-
-function apiEquivalentCostFromUsage(tokenUsage: TokenUsage) {
-  const input = tokenUsage.input ?? 0;
-  const cached = Math.min(input, Math.max(0, tokenUsage.cachedInput ?? 0));
-  const output = tokenUsage.output ?? 0;
-  const uncached = Math.max(0, input - cached);
-  const total = tokenUsage.total ?? uncached + cached + output;
-  const estimated = (uncached / 1_000_000) * 5 + (cached / 1_000_000) * 0.5 + (output / 1_000_000) * 30;
-
-  return { cached, estimated, output, total, uncached };
-}
-
-function apiEquivalentCost(snapshot: UsageSnapshot) {
-  return apiEquivalentCostFromUsage(snapshot.tokenUsage);
 }
 
 function formatDate(value: string) {
@@ -142,10 +112,6 @@ function formatFullDate(value: string) {
   }
 
   return fullDateFormatter.format(date);
-}
-
-function periodStartLabel(value: string | undefined) {
-  return value?.split(" · ")[0] ?? "";
 }
 
 function remainingTimeText(value: string) {
@@ -231,17 +197,19 @@ function sortWindows(windows: UsageWindow[]) {
 const currentWindowLabel = window.__TAURI_INTERNALS__ ? getCurrentWindow().label : "main";
 
 export function App() {
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [switching, setSwitching] = useState(false);
   const [snapshot, setSnapshot] = useState<UsageSnapshot | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [tokenExpanded, setTokenExpanded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [codexConnected, setCodexConnected] = useState(false);
   const [error, setError] = useState("");
-  const snapshotRef = useRef<UsageSnapshot | null>(null);
 
   useEffect(() => {
     let disposed = false;
-    let stopListening: (() => void) | undefined;
+    const listeners: Array<() => void> = [];
 
     function applyTheme(theme: ThemeName) {
       document.documentElement.dataset.theme = theme;
@@ -250,29 +218,42 @@ export function App() {
     void desktopApi.getSettings().then((settings) => {
       if (!disposed) {
         applyTheme(settings.theme);
+        setSettings(settings);
       }
-    });
+    }).catch((error) => { if (!disposed) setError(String(error)); });
     if (window.__TAURI_INTERNALS__) {
-      void listen<ThemeName>("theme-changed", (event) => applyTheme(event.payload)).then((unlisten) => {
+      function keepListener(unlisten: () => void) {
         if (disposed) {
           unlisten();
         } else {
-          stopListening = unlisten;
+          listeners.push(unlisten);
         }
-      });
+      }
+      void listen<ThemeName>("theme-changed", (event) => applyTheme(event.payload)).then(keepListener);
+      void listen<AppSettings>("usage-display-changed", (event) => setSettings(event.payload)).then(keepListener);
+      void listen<string>("settings-error", (event) => setError(event.payload)).then(keepListener);
     }
 
     return () => {
       disposed = true;
-      stopListening?.();
+      listeners.forEach((unlisten) => unlisten());
     };
   }, []);
 
+  const provider = settings?.activeProvider ?? "codex";
+  const providerName = provider === "claude" ? "Claude" : "Codex";
+
   useEffect(() => {
+    if (!settings) return;
     let mounted = true;
+    let inFlight = false;
+    setSnapshot(null);
+    setLoading(true);
+    setError("");
+    setCodexConnected(false);
+    setTokenExpanded(false);
 
     function applySnapshot(usage: UsageSnapshot, connected?: boolean) {
-      snapshotRef.current = usage;
       setSnapshot(usage);
       setError("");
       if (connected !== undefined) {
@@ -281,19 +262,23 @@ export function App() {
     }
 
     async function loadLatest() {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const usage = await desktopApi.getUsageSnapshot();
+        const usage = await desktopApi.getUsageSnapshot(provider);
         if (mounted) {
-          applySnapshot(usage, usage.accountSource === "codexAppServer");
+          applySnapshot(usage, usage.accountSource === "codexAppServer" || usage.accountSource === "claudeMod");
         }
       } catch (loadError) {
         if (mounted) {
           setCodexConnected(false);
         }
-        if (mounted && !snapshotRef.current) {
-          setError(loadError instanceof Error ? loadError.message : "读取失败");
+        if (mounted) {
+          setError(String(loadError));
+          if (provider === "claude") setSnapshot(null);
         }
       } finally {
+        inFlight = false;
         if (mounted) {
           setLoading(false);
         }
@@ -301,12 +286,13 @@ export function App() {
     }
 
     async function boot() {
-      const cached = await desktopApi.getCachedUsageSnapshot();
-      if (mounted && cached) {
-        applySnapshot(cached);
-        setLoading(false);
+      try {
+        const cached = await desktopApi.getCachedUsageSnapshot(provider);
+        if (mounted && cached) { applySnapshot(cached); setLoading(false); }
+      } catch (error) {
+        if (mounted) setError(String(error));
       }
-      await loadLatest();
+      if (mounted) await loadLatest();
     }
 
     void boot();
@@ -316,7 +302,7 @@ export function App() {
       mounted = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [provider, settings !== null]);
 
   const windows = useMemo(() => sortWindows(snapshot?.windows ?? []), [snapshot?.windows]);
   const sortedResets = useMemo(
@@ -326,12 +312,6 @@ export function App() {
       ),
     [snapshot?.resets]
   );
-  const tokenUsed =
-    snapshot && snapshot.tokenUsage.total !== null && snapshot.tokenUsage.total !== undefined
-      ? snapshot.tokenUsage.total
-      : snapshot && (snapshot.tokenUsage.input !== null || snapshot.tokenUsage.output !== null)
-        ? (snapshot.tokenUsage.input ?? 0) + (snapshot.tokenUsage.output ?? 0)
-        : null;
   const resetCount = snapshot?.resetCredits?.available ?? sortedResets.length;
   const canExpand = resetCount > 0 && sortedResets.length > 0;
   const resetExpanded = expanded && canExpand;
@@ -339,7 +319,7 @@ export function App() {
     ? resetDetailBaseExtraHeight + resetDetailRowExtraHeight * Math.min(sortedResets.length, 12)
     : 0) + (tokenExpanded ? apiCostPanelExtraHeight : 0);
   const statusClass = codexConnected ? "is-connected" : loading ? "is-loading" : "is-offline";
-  const statusTitle = codexConnected ? "Codex 已连接" : loading ? "正在连接 Codex" : "Codex 未连接";
+  const statusTitle = codexConnected ? (provider === "claude" ? "Claude Code 会话快照" : "Codex 已连接") : loading ? `正在读取 ${providerName}` : `${providerName} 数据未更新`;
 
   useEffect(() => {
     if (!canExpand) {
@@ -356,7 +336,15 @@ export function App() {
   }, [resetExpanded, tokenExpanded, extraHeight]);
 
   if (currentWindowLabel === "dock") {
-    return <DockBar loading={loading} snapshot={snapshot} windows={windows} />;
+    return <DockBar provider={provider} error={error} loading={loading} snapshot={snapshot} windows={windows} />;
+  }
+
+  async function changeMode(mode: UsageMode) {
+    if (!settings) return;
+    setSwitching(true);
+    try { setSettings(await desktopApi.setUsageMode(mode, settings.rotationIntervalSecs)); }
+    catch (error) { setError(String(error)); }
+    finally { setSwitching(false); }
   }
 
   function toggleExpanded() {
@@ -377,19 +365,29 @@ export function App() {
       onMouseEnter={() => setHoverRegion("main", true)}
       onMouseLeave={() => setHoverRegion("main", false)}
     >
-      <section className={canExpand ? "widget has-reset-details" : "widget"} aria-label="Codex 用量组件">
+      <section className={canExpand ? "widget has-reset-details" : "widget"} aria-label={`${providerName} 用量组件`}>
         <div className="chrome drag-region" data-tauri-drag-region>
           <div className="brand">
             <span className="brand-icon-wrap" title={statusTitle}>
-              <img className="brand-icon" src={dockIcon} alt="" />
+              {provider === "codex" ? <img className="brand-icon" src={dockIcon} alt="" /> : <span className="claude-mark" aria-hidden="true">C</span>}
               <span className={`status-dot ${statusClass}`} />
             </span>
-            <strong className="brand-title"><span>CODEX</span><em>用量核心</em></strong>
+            <strong className="brand-title"><span>{providerName.toUpperCase()}</span><em>用量核心</em></strong>
           </div>
           <div className="plan-meta">
-            <span className="plan-badge">{compactPlanName(snapshot?.planName)}</span>
+            <span className="plan-badge">{provider === "claude" ? "会话用量" : compactPlanName(snapshot?.planName)}</span>
           </div>
         </div>
+
+        <div className="source-toolbar">
+          <div className="source-tabs" role="group" aria-label="用量来源">
+            {([{ mode: "codex", label: "Codex" }, { mode: "claude", label: "Claude" }, { mode: "rotate", label: "自动轮播" }] satisfies Array<{mode: UsageMode; label: string}>).map(({mode, label}) => (
+              <button key={mode} aria-pressed={settings?.usageMode === mode} disabled={!settings || switching} onClick={() => void changeMode(mode)}>{label}</button>
+            ))}
+          </div>
+          <button className="settings-button" title="显示设置：屏幕、轮播间隔、Claude 接入" aria-label="显示设置" disabled={!settings} onClick={() => setSettingsOpen(true)}><Settings2 size={16} /></button>
+        </div>
+        {error && snapshot && <div className="data-warning" role="alert">更新失败，显示上次数据：{error}</div>}
 
         {snapshot ? (
           <>
@@ -399,9 +397,11 @@ export function App() {
               ))}
             </div>
 
-            <TokenBlock expanded={tokenExpanded} onToggle={toggleTokenExpanded} snapshot={snapshot} tokenUsed={tokenUsed} />
+            <UsageAnalytics expanded={tokenExpanded} onToggle={toggleTokenExpanded} snapshot={snapshot} />
 
-            {canExpand ? (
+            {provider === "claude" ? (
+              <div className="claude-source-note"><strong>来自 Claude Code 会话</strong><p>最近读数：{formatFullDate(snapshot.updatedAt)}</p><p>用量随会话更新。窗口到期后等待新读数。</p><p>银行重置余额：官方 Mods 接口尚未提供。</p></div>
+            ) : canExpand ? (
               <ResetOverview
                 resets={sortedResets}
                 availableCount={resetCount}
@@ -423,16 +423,21 @@ export function App() {
         )}
 
         {loading && <div className="loading-sheen" />}
+        {settingsOpen && settings && <DisplaySettings settings={settings} onChange={setSettings} onClose={() => setSettingsOpen(false)} />}
       </section>
     </main>
   );
 }
 
 function DockBar({
+  provider,
+  error,
   loading,
   snapshot,
   windows
 }: {
+  provider: UsageProvider;
+  error: string;
   loading: boolean;
   snapshot: UsageSnapshot | null;
   windows: UsageWindow[];
@@ -452,9 +457,10 @@ function DockBar({
         event.stopPropagation();
       }}
     >
-      <section className={singleWindow ? "dock-widget is-single" : "dock-widget"} aria-label="Codex 用量悬浮条">
-        <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={dockIcon} alt="" />
+      <section className={singleWindow ? "dock-widget is-single" : "dock-widget"} aria-label={`${provider} 用量悬浮条`} title={error || (snapshot ? `最近读数：${formatFullDate(snapshot.updatedAt)}` : "等待用量数据")}>
+        {provider === "codex" ? <img className={loading ? "dock-icon is-loading" : "dock-icon"} src={dockIcon} alt="Codex" /> : <span className="claude-mark dock-icon" aria-label="Claude">C</span>}
         <div className={singleWindow ? "dock-meters is-single" : "dock-meters"}>
+          {windows.length === 0 && <span className="dock-empty">{provider === "claude" ? "Claude" : "Codex"} · {loading ? "读取中…" : "等待数据 · 右键设置"}</span>}
           {windows.map((usageWindow) => (
             <DockMeter key={usageWindow.id} single={singleWindow} window={usageWindow} />
           ))}
@@ -607,138 +613,6 @@ function SummaryCard({
   );
 }
 
-function TokenBlock({
-  expanded,
-  onToggle,
-  snapshot,
-  tokenUsed
-}: {
-  expanded: boolean;
-  onToggle: () => void;
-  snapshot: UsageSnapshot;
-  tokenUsed: number | null;
-}) {
-  const [period, setPeriod] = useState<ApiCostPeriod>("thisWeek");
-  const hasSplit = snapshot.tokenUsage.input !== null || snapshot.tokenUsage.output !== null;
-  const tokenPeriods = snapshot.tokenPeriods ?? [];
-  const selectedPeriod = tokenPeriods.find((item) => item.id === period) ?? tokenPeriods[0];
-  const currentCost = selectedPeriod
-    ? apiEquivalentCostFromUsage(selectedPeriod.tokenUsage)
-    : apiEquivalentCost(snapshot);
-
-  return (
-    <div className="token-section">
-      <div className="token-summary-grid">
-        <button className={expanded ? "token-block is-expanded" : "token-block"} type="button" onClick={onToggle}>
-          <div className="token-title">
-            <Database size={16} />
-            <span>Token</span>
-          </div>
-          <div className="token-total">{formatToken(tokenUsed)}</div>
-          {hasSplit && (
-            <div className="token-metrics">
-              <span>
-                <small>输入</small>
-                <strong>{formatToken(snapshot.tokenUsage.input)}</strong>
-              </span>
-              <span>
-                <small>输出</small>
-                <strong>{formatToken(snapshot.tokenUsage.output)}</strong>
-              </span>
-              {snapshot.tokenUsage.limit !== null && (
-                <span>
-                  <small>上限</small>
-                  <strong>{formatToken(snapshot.tokenUsage.limit)}</strong>
-                </span>
-              )}
-            </div>
-          )}
-        </button>
-        <button className={expanded ? "api-summary-card is-expanded" : "api-summary-card"} type="button" onClick={onToggle}>
-          <div className="api-summary-head">
-            <span>API 等价成本</span>
-            <span className="token-chevron">{expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</span>
-          </div>
-          <strong>{moneyFormatter.format(currentCost.estimated)}</strong>
-          <small>{selectedPeriod?.label ?? "本周"}</small>
-        </button>
-      </div>
-      {expanded && (
-        <ApiCostPanel
-          cost={currentCost}
-          period={period}
-          periodUsage={selectedPeriod}
-          snapshot={snapshot}
-          onPeriodChange={setPeriod}
-        />
-      )}
-    </div>
-  );
-}
-function ApiCostPanel({
-  cost,
-  period,
-  periodUsage,
-  snapshot,
-  onPeriodChange
-}: {
-  cost: ReturnType<typeof apiEquivalentCostFromUsage>;
-  period: ApiCostPeriod;
-  periodUsage: TokenPeriodUsage | undefined;
-  snapshot: UsageSnapshot;
-  onPeriodChange: (period: ApiCostPeriod) => void;
-}) {
-  const range = periodUsage?.rangeLabel;
-  const computedAt = periodUsage?.computedAt ?? snapshot.updatedAt;
-  const sourceText = periodUsage ? "本地会话" : "当前快照";
-  const periodStart = periodStartLabel(range);
-
-  return (
-    <section className="api-cost-panel" aria-label="API 等价成本">
-      <div className="api-period-tabs" role="tablist" aria-label="成本周期">
-        {apiCostPeriods.map((item) => (
-          <button
-            aria-selected={period === item.id}
-            className={period === item.id ? "is-active" : ""}
-            key={item.id}
-            onClick={() => onPeriodChange(item.id)}
-            role="tab"
-            type="button"
-          >
-            {item.label}
-          </button>
-        ))}
-      </div>
-      <div className="api-cost-head">
-        <div>
-          <span>API 等价成本</span>
-          <small>
-            计算于 {formatFullDate(computedAt)}{periodStart ? ` · ${periodStart}` : ""} · {sourceText}
-          </small>
-        </div>
-        <strong>{moneyFormatter.format(cost.estimated)}</strong>
-      </div>
-      <div className="api-cost-grid">
-        <span>
-          <small>Tokens</small>
-          <strong>{tokenText(cost.total)}</strong>
-        </span>
-        <span>
-          <small>非缓存输入</small>
-          <strong>{tokenText(cost.uncached)}</strong>
-        </span>
-        <span>
-          <small>缓存输入</small>
-          <strong>{tokenText(cost.cached)}</strong>
-        </span>
-        <span>
-          <small>输出 tokens</small>
-          <strong>{tokenText(cost.output)}</strong>
-        </span>
-      </div>
-    </section>
-  );
-}
 function UsageCard({ window }: { window: UsageWindow }) {
   const remaining = remainingOf(window);
   const remainingPercent = ratio(remaining, window.total);
