@@ -2682,7 +2682,7 @@ fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
             }
         }
         "quit" => {
-            diagnostics::record("quit requested from menu");
+            diagnostics::request_exit("menu");
             let _ = app.save_window_state(StateFlags::POSITION);
             app.exit(0);
         }
@@ -2752,7 +2752,16 @@ fn create_tray(app: &AppHandle, state: AppState) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if diagnostics::handle_cli() { return; }
     if claude::handle_cli() { return; }
+    match dirs::data_local_dir() {
+        Some(directory) => {
+            if let Err(error) = diagnostics::initialize(&directory.join("net.local.codex-info").join("logs")) {
+                eprintln!("初始化诊断日志失败: {error}");
+            }
+        }
+        None => eprintln!("无法确定诊断日志目录"),
+    }
     let state = AppState {
         claude_usage_cache: Arc::new(Mutex::new(HashMap::new())),
         analytics_history: Arc::new(Mutex::new(analytics::History::default())),
@@ -2790,6 +2799,7 @@ pub fn run() {
         ))
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
+            diagnostics::report_frontend_error,
             get_cached_usage_snapshot,
             get_usage_snapshot,
             get_settings,
@@ -2810,14 +2820,6 @@ pub fn run() {
             handle_menu_event(app, &menu_state, event.id.as_ref());
         })
         .setup(move |app| {
-            match app.path().app_log_dir() {
-                Ok(directory) => {
-                    if let Err(error) = diagnostics::initialize(&directory) {
-                        eprintln!("初始化诊断日志失败: {error}");
-                    }
-                }
-                Err(error) => eprintln!("获取诊断日志目录失败: {error}"),
-            }
             create_tray(app.handle(), state.clone())?;
             let stored_settings = read_stored_settings(app.handle()).unwrap_or_default();
             {
@@ -2887,11 +2889,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_, event| match event {
-            tauri::RunEvent::Ready => diagnostics::record("event loop ready"),
+            tauri::RunEvent::Ready => diagnostics::ready(),
             tauri::RunEvent::ExitRequested { code, .. } => {
                 diagnostics::record(&format!("exit requested code={code:?}"));
             }
-            tauri::RunEvent::Exit => diagnostics::record("event loop exit"),
+            tauri::RunEvent::Exit => diagnostics::event_loop_exit(),
             tauri::RunEvent::WindowEvent { label, event, .. } => match event {
                 tauri::WindowEvent::CloseRequested { .. } => {
                     diagnostics::record(&format!("window close requested label={label}"));

@@ -90,6 +90,7 @@ export type AppSettings = {
 };
 
 export type DesktopApi = {
+  reportFrontendError: (source: "error" | "unhandledrejection", message: string) => Promise<void>;
   getUsageSnapshot: (provider: UsageProvider) => Promise<UsageSnapshot>;
   getCachedUsageSnapshot: (provider: UsageProvider) => Promise<UsageSnapshot | null>;
   setUsageMode: (mode: UsageMode, intervalSecs: number) => Promise<AppSettings>;

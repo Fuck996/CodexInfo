@@ -116,6 +116,14 @@ For development and packaging:
 - Rust
 - Microsoft C++ Build Tools
 
+## Failure monitoring and logs
+
+Each widget run starts an independent monitor. It records the process exit code and then exits, without restarting the widget. Every 30 seconds it samples memory, handles, GDI / USER objects, and window responsiveness. Runtime logging also captures Rust panics, unhandled frontend errors, menu exit requests, and window lifecycle events.
+
+Logs are stored in `%LOCALAPPDATA%\net.local.codex-info\logs`: `lifecycle.log` contains runtime events; `monitor-<PID>-<creation-time>.log` contains samples and the final exit code; its `.json` file records the run phase and exit intent. Files rotate at 512 KiB with one previous segment. Completed monitor records beyond the latest 20 runs are cleaned up. A failed monitor launch is explicitly logged as `monitor_start_failed`.
+
+Logs stay local. Review error text and local paths before sharing them. An exit code identifies the termination result but does not necessarily identify which program terminated the process.
+
 ## Privacy
 
 CodexInfo does not upload session logs. Codex uses local credentials to request official usage/reset endpoints; Claude exports counters through the local plugin, without CodexInfo reading Claude credentials. Quota observation history stays in the app data directory.

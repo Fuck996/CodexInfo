@@ -8,6 +8,7 @@ declare global {
 }
 
 const tauriApi: DesktopApi = {
+  reportFrontendError: (source, message) => invoke<void>("report_frontend_error", { source, message }),
   getUsageSnapshot: (provider) => invoke<UsageSnapshot>("get_usage_snapshot", { provider }),
   getCachedUsageSnapshot: (provider) => invoke<UsageSnapshot | null>("get_cached_usage_snapshot", { provider }),
   setUsageMode: (mode, intervalSecs) => invoke<AppSettings>("set_usage_mode", { mode, intervalSecs }),
@@ -26,6 +27,7 @@ const tauriApi: DesktopApi = {
 };
 
 const unavailableApi: DesktopApi = {
+  reportFrontendError: async () => { throw new Error("Tauri 桥接不可用"); },
   getUsageSnapshot: async () => {
     throw new Error("Tauri 桥接不可用，请使用 npm run tauri:dev 或打包后的程序启动。");
   },
