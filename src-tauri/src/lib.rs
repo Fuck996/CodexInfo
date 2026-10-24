@@ -4,7 +4,7 @@ mod analytics;
 mod monitors;
 use monitors::{target_monitor, get_monitors, set_selected_monitor};
 
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Local, Utc};
 use reqwest::{blocking::Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2196,7 +2196,13 @@ fn set_usage_mode(app: AppHandle, mode: UsageMode, interval_secs: u64) -> Result
 fn notify_usage_display(app: &AppHandle, state: &AppState) {
     if let Ok(mut usage) = state.latest_tray_usage.lock() { *usage = None; }
     update_tray_display(app, state);
-    if let Ok(settings) = get_settings(app.clone()) { let _ = app.emit("usage-display-changed", &settings); }
+    match get_settings(app.clone()) {
+        Ok(settings) => { let _ = app.emit("usage-display-changed", &settings); }
+        Err(error) => {
+            diagnostics::record(&format!("读取显示设置失败: {error}"));
+            let _ = app.emit("settings-error", error);
+        }
+    }
     refresh_tray_menu(app);
 }
 

@@ -4,7 +4,7 @@ export function register(on) {
     if (result.usage) {
       await exportReading($, {
         type: "sample",
-        id: `${await $.session.id()}-${event.turnId}-${event.agentId ?? "main"}-${event.index}`,
+        id: await fileIdentifier(`${await $.session.id()}-${event.turnId}-${event.agentId ?? "main"}-${event.index}`),
         timestamp: new Date().toISOString(),
         usage: result.usage
       });
@@ -15,12 +15,17 @@ export function register(on) {
     const result = await next(event);
     await exportReading($, {
       type: "reading",
-      sessionId: await $.session.id(),
+      sessionId: await fileIdentifier(await $.session.id()),
       updatedAt: new Date().toISOString(),
       rateLimits: event.rateLimits
     });
     return result;
   });
+}
+
+async function fileIdentifier(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function exportReading($, reading) {

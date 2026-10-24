@@ -288,6 +288,7 @@ pub fn install(root: &Path, executable: &Path) -> Result<String, String> {
     )
     .map_err(|error| error.to_string())?;
     let cli = find_cli()?;
+    run_cli(&cli, &["plugin", "validate", &plugin.to_string_lossy()])?;
     run_cli(
         &cli,
         &[
