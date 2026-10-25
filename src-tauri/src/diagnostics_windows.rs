@@ -1,4 +1,4 @@
-use super::{exit_kind, run_path, RollingLog, SessionStatus};
+use super::{exit_kind, remove_metadata, run_path, write_metadata, RollingLog, SessionStatus};
 use std::{
     ffi::OsString,
     fs,
@@ -37,6 +37,41 @@ use windows::{
 };
 
 const KILL_ON_JOB_CLOSE: u32 = 0x2000;
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+const HEALTHY_LOG_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MonitorReady {
+    pid: u32,
+    creation_time: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum SampleHealth {
+    Windows { unresponsive: usize },
+    Error(String),
+}
+
+#[derive(Default)]
+struct SampleSchedule {
+    health: Option<SampleHealth>,
+    written_at: Option<Instant>,
+}
+
+impl SampleSchedule {
+    fn should_write(&mut self, now: Instant, health: SampleHealth) -> bool {
+        if self.health.as_ref() == Some(&health)
+            && self
+                .written_at
+                .is_some_and(|last| now.duration_since(last) < HEALTHY_LOG_INTERVAL)
+        {
+            return false;
+        }
+        self.health = Some(health);
+        self.written_at = Some(now);
+        true
+    }
+}
 
 struct Process(HANDLE);
 
@@ -193,10 +228,18 @@ pub(super) fn launch_monitor(directory: &Path, created: u64) -> Result<u32, Stri
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(6) {
         match fs::read_to_string(&ready) {
-            Ok(value) if value.trim() == result.process_id.to_string() => {
-                return Ok(result.process_id)
+            Ok(value) => {
+                let ready: MonitorReady = serde_json::from_str(&value)
+                    .map_err(|error| format!("监控就绪标识无效: {error}"))?;
+                let monitor =
+                    Process::open(result.process_id).map_err(|error| error.to_string())?;
+                if ready.pid != result.process_id
+                    || ready.creation_time != monitor.creation_time()?
+                {
+                    return Err("监控就绪标识与启动进程不一致".into());
+                }
+                return Ok(result.process_id);
             }
-            Ok(_) => return Err("监控就绪标识与启动进程不一致".into()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 thread::sleep(Duration::from_millis(100))
             }
@@ -226,7 +269,7 @@ unsafe extern "system" fn collect_window(hwnd: HWND, data: LPARAM) -> BOOL {
     BOOL(1)
 }
 
-fn sample(process: &Process, pid: u32) -> Result<String, String> {
+fn sample(process: &Process, pid: u32) -> Result<(String, SampleHealth), String> {
     let mut memory = PROCESS_MEMORY_COUNTERS_EX {
         cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
         ..Default::default()
@@ -269,9 +312,10 @@ fn sample(process: &Process, pid: u32) -> Result<String, String> {
             unresponsive += 1;
         }
     }
-    Ok(format!("heartbeat target_pid={pid} private_bytes={} working_set_bytes={} handles={handles} gdi={} user={} windows={} unresponsive_windows={unresponsive}",
+    let event = format!("heartbeat target_pid={pid} private_bytes={} working_set_bytes={} handles={handles} gdi={} user={} windows={} unresponsive_windows={unresponsive}",
         memory.PrivateUsage, memory.WorkingSetSize, unsafe { GetGuiResources(process.0, GR_GDIOBJECTS) },
-        unsafe { GetGuiResources(process.0, GR_USEROBJECTS) }, probe.windows.len()))
+        unsafe { GetGuiResources(process.0, GR_USEROBJECTS) }, probe.windows.len());
+    Ok((event, SampleHealth::Windows { unresponsive }))
 }
 
 pub(super) fn monitor_cli(args: Vec<OsString>) -> Result<(), String> {
@@ -314,12 +358,17 @@ fn monitor(log: &mut RollingLog, directory: &Path, pid: u32, created: u64) -> Re
     ))
     .map_err(|error| error.to_string())?;
     let ready = run_path(directory, pid, created, "ready");
-    let ready_temporary = ready.with_extension("ready.tmp");
-    fs::write(&ready_temporary, std::process::id().to_string())
-        .map_err(|error| error.to_string())?;
-    fs::rename(ready_temporary, &ready).map_err(|error| error.to_string())?;
+    let marker = MonitorReady {
+        pid: std::process::id(),
+        creation_time: current_creation_time()?,
+    };
+    write_metadata(
+        &ready,
+        &serde_json::to_vec(&marker).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     let result = watch_process(log, &process, directory, pid, created);
-    fs::remove_file(&ready).map_err(|error| format!("清理监控就绪标识失败: {error}"))?;
+    remove_metadata(&ready).map_err(|error| format!("清理监控就绪标识失败: {error}"))?;
     result
 }
 
@@ -331,16 +380,24 @@ fn watch_process(
     created: u64,
 ) -> Result<(), String> {
     let mut sampled_at: Option<Instant> = None;
+    let mut schedule = SampleSchedule::default();
+    let mut last_sample = None;
     loop {
         match unsafe { WaitForSingleObject(process.0, 5000) } {
             WAIT_OBJECT_0 => break,
             WAIT_TIMEOUT => {
-                if sampled_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(30)) {
-                    let event = match sample(process, pid) {
-                        Ok(event) => event,
-                        Err(error) => format!("sample_error target_pid={pid} {error}"),
+                if sampled_at.is_none_or(|last| last.elapsed() >= SAMPLE_INTERVAL) {
+                    let (event, health) = match sample(process, pid) {
+                        Ok(sample) => sample,
+                        Err(error) => (
+                            format!("sample_error target_pid={pid} {error}"),
+                            SampleHealth::Error(error),
+                        ),
                     };
-                    log.write(&event).map_err(|error| error.to_string())?;
+                    if schedule.should_write(Instant::now(), health) {
+                        log.write(&event).map_err(|error| error.to_string())?;
+                    }
+                    last_sample = Some(event);
                     sampled_at = Some(Instant::now());
                 }
             }
@@ -372,66 +429,97 @@ fn watch_process(
         Err(error) => format!("kind=unknown state_error={error:?}"),
     };
     log.write(&format!(
-        "process_exit target_pid={pid} exit_code={code} exit_hex=0x{code:08x} {classification}"
+        "process_exit target_pid={pid} exit_code={code} exit_hex=0x{code:08x} {classification} last_sample_age_secs={:?} last_sample={last_sample:?}",
+        sampled_at.map(|time| time.elapsed().as_secs())
     ))
     .map_err(|error| error.to_string())
 }
 
-pub(super) fn prune_old_runs(directory: &Path) -> Result<(), String> {
-    let mut runs = Vec::new();
-    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(stem) = name
-            .strip_prefix("monitor-")
-            .and_then(|name| name.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        let Some((pid, created)) = stem.split_once('-') else {
-            continue;
-        };
-        let (Ok(pid), Ok(created)) = (pid.parse::<u32>(), created.parse::<u64>()) else {
-            continue;
-        };
-        runs.push((created, pid));
+fn process_matches(pid: u32, created: u64) -> Result<bool, String> {
+    match Process::open(pid) {
+        Ok(process) => Ok(process.creation_time()? == created
+            && unsafe { WaitForSingleObject(process.0, 0) } == WAIT_TIMEOUT),
+        Err(error) if error.code() == HRESULT::from_win32(87) => Ok(false),
+        Err(error) => Err(format!("检查诊断进程失败 pid={pid}: {error}")),
     }
-    runs.sort_unstable_by(|left, right| right.cmp(left));
-    for (created, pid) in runs.into_iter().skip(20) {
-        if run_path(directory, pid, created, "ready").exists() {
-            continue;
-        }
-        match Process::open(pid) {
-            Ok(process) if process.creation_time()? == created => continue,
-            Ok(_) => {}
-            Err(error) if error.code() == HRESULT::from_win32(87) => {}
-            Err(error) => return Err(format!("检查旧监控进程失败: {error}")),
-        }
-        for extension in [
-            "log",
-            "previous.log",
-            "json",
-            "json.tmp",
-            "ready.tmp",
-            "ready",
-        ] {
-            let path = run_path(directory, pid, created, extension);
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("清理旧诊断失败: {error}")),
+}
+
+pub(super) fn run_is_active(directory: &Path, pid: u32, created: u64) -> Result<bool, String> {
+    if process_matches(pid, created)? {
+        return Ok(true);
+    }
+    let ready = run_path(directory, pid, created, "ready");
+    match fs::read(&ready) {
+        Ok(bytes) => match serde_json::from_slice::<MonitorReady>(&bytes) {
+            Ok(monitor) => process_matches(monitor.pid, monitor.creation_time),
+            // 旧版本只写 PID；没有创建时间的标识不能证明监控进程仍然存活。
+            Err(_)
+                if String::from_utf8_lossy(&bytes)
+                    .trim()
+                    .parse::<u32>()
+                    .is_ok() =>
+            {
+                Ok(false)
             }
-        }
+            Err(error) => Err(format!("监控标识损坏 {}: {error}", ready.display())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("读取旧监控标识失败: {error}")),
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn healthy_samples_write_every_ten_minutes_but_health_changes_write_immediately() {
+        let mut schedule = SampleSchedule::default();
+        let start = Instant::now();
+        let healthy = SampleHealth::Windows { unresponsive: 0 };
+        assert!(schedule.should_write(start, healthy.clone()));
+        for seconds in (30..600).step_by(30) {
+            assert!(!schedule.should_write(start + Duration::from_secs(seconds), healthy.clone()));
+        }
+        assert!(schedule.should_write(start + Duration::from_secs(600), healthy.clone()));
+        assert!(schedule.should_write(
+            start + Duration::from_secs(630),
+            SampleHealth::Windows { unresponsive: 1 }
+        ));
+        assert!(!schedule.should_write(
+            start + Duration::from_secs(660),
+            SampleHealth::Windows { unresponsive: 1 }
+        ));
+        assert!(schedule.should_write(start + Duration::from_secs(690), healthy));
+        assert!(schedule.should_write(
+            start + Duration::from_secs(720),
+            SampleHealth::Error("access denied".into())
+        ));
+    }
+
+    #[test]
+    fn stale_ready_markers_and_reused_pids_do_not_protect_dead_runs() {
+        let directory = std::env::temp_dir().join(format!(
+            "codexinfo-ready-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let created = current_creation_time().unwrap();
+        let pid = std::process::id();
+        assert!(run_is_active(&directory, pid, created).unwrap());
+        assert!(!run_is_active(&directory, pid, created - 1).unwrap());
+        let path = run_path(&directory, pid, created - 1, "ready");
+        fs::write(&path, pid.to_string()).unwrap();
+        assert!(!run_is_active(&directory, pid, created - 1).unwrap());
+        let marker = MonitorReady {
+            pid,
+            creation_time: created,
+        };
+        fs::write(&path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        assert!(run_is_active(&directory, pid, created - 1).unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     fn exercise_exit(forced: bool) -> String {
         let directory = std::env::temp_dir().join(format!(

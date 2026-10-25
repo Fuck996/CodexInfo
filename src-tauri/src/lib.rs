@@ -28,7 +28,7 @@ use std::os::windows::process::CommandExt;
 use tauri::{
     image::Image,
     menu::{CheckMenuItem, Menu, MenuItem, Submenu},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     window::{ProgressBarState, ProgressBarStatus},
     AppHandle, Emitter, Manager, Runtime, WebviewWindow,
 };
@@ -1092,28 +1092,40 @@ fn build_tray_usage_text(snapshot: &UsageSnapshot) -> Option<TrayUsageText> {
     })
 }
 
-fn update_tray_display(app: &AppHandle, state: &AppState) {
-    let Some(tray) = app.tray_by_id("main-tray") else {
-        return;
-    };
-    if !state.tray_usage_enabled.load(Ordering::Relaxed) {
-        let _ = tray.set_title(None::<&str>);
-        let _ = tray.set_tooltip(Some("CodexInfo"));
-        return;
+fn with_main_tray(app: &AppHandle, update: impl FnOnce(&AppHandle, &TrayIcon) + Send + 'static) {
+    let handle = app.clone();
+    // TrayIcon 内部仍是 Rc，获取、克隆和释放也必须留在主线程。
+    if let Err(error) = app.run_on_main_thread(move || {
+        if let Some(tray) = handle.tray_by_id("main-tray") {
+            update(&handle, &tray);
+        }
+    }) {
+        diagnostics::record(&format!("tray_dispatch_error {error}"));
     }
+}
 
-    let usage = state
-        .latest_tray_usage
-        .lock()
-        .ok()
-        .and_then(|usage| usage.clone());
-    if let Some(usage) = usage {
-        let _ = tray.set_title(Some(usage.title));
-        let _ = tray.set_tooltip(Some(usage.tooltip));
-    } else {
-        let _ = tray.set_title(None::<&str>);
-        let _ = tray.set_tooltip(Some("CodexInfo"));
-    }
+fn update_tray_display(app: &AppHandle, state: &AppState) {
+    let state = state.clone();
+    with_main_tray(app, move |_, tray| {
+        if !state.tray_usage_enabled.load(Ordering::Relaxed) {
+            let _ = tray.set_title(None::<&str>);
+            let _ = tray.set_tooltip(Some("CodexInfo"));
+            return;
+        }
+
+        let usage = state
+            .latest_tray_usage
+            .lock()
+            .ok()
+            .and_then(|usage| usage.clone());
+        if let Some(usage) = usage {
+            let _ = tray.set_title(Some(usage.title));
+            let _ = tray.set_tooltip(Some(usage.tooltip));
+        } else {
+            let _ = tray.set_title(None::<&str>);
+            let _ = tray.set_tooltip(Some("CodexInfo"));
+        }
+    });
 }
 
 fn update_taskbar_display(app: &AppHandle, state: &AppState) {
@@ -1130,9 +1142,10 @@ fn update_taskbar_display(app: &AppHandle, state: &AppState) {
 }
 
 fn update_tray_visibility(app: &AppHandle, state: &AppState) {
-    if let Some(tray) = app.tray_by_id("main-tray") {
+    let state = state.clone();
+    with_main_tray(app, move |_, tray| {
         let _ = tray.set_visible(!state.dock_enabled.load(Ordering::Relaxed));
-    }
+    });
 }
 
 #[cfg(target_os = "windows")]
@@ -2598,11 +2611,11 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 }
 
 fn refresh_tray_menu(app: &AppHandle) {
-    if let Some(tray) = app.tray_by_id("main-tray") {
+    with_main_tray(app, |app, tray| {
         if let Ok(menu) = build_app_menu(app) {
             let _ = tray.set_menu(Some(menu));
         }
-    }
+    });
 }
 
 fn handle_menu_event(app: &AppHandle, state: &AppState, id: &str) {
