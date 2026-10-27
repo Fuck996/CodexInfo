@@ -137,7 +137,7 @@ pub(super) fn enrich(
                         .ok()
                         .map(|time| time.with_timezone(&Utc))
                 })
-                .filter(|time| *time < end)
+                .filter(|time| *time < end && !same_cycle_end(*time, end, &provider))
                 .max();
             Some(CycleComparison {
                 window_id: window.id.clone(),
@@ -164,6 +164,11 @@ pub(super) fn enrich(
         })
         .collect();
     Ok(())
+}
+
+fn same_cycle_end(left: DateTime<Utc>, right: DateTime<Utc>, provider: &str) -> bool {
+    // Claude 账号接口的同一重置秒存在小数秒漂移；仅归并统计，不改原始时间。
+    left == right || (provider == "claude" && left.timestamp() == right.timestamp())
 }
 
 fn summarize(
@@ -201,7 +206,7 @@ fn summarize(
             let window = point.windows.iter().find(|window| {
                 window.window_duration_mins == duration
                     && DateTime::parse_from_rfc3339(&window.reset_at)
-                        .is_ok_and(|reset| reset.with_timezone(&Utc) == end)
+                        .is_ok_and(|reset| same_cycle_end(reset.with_timezone(&Utc), end, provider))
             })?;
             Some((point.at, window.used / window.total * 100.0))
         })
@@ -330,6 +335,33 @@ fn cost(sample: &TokenUsageSample, provider: &str) -> Option<(f64, f64)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn claude_subsecond_reset_drift_keeps_one_cycle_and_original_timestamps() {
+        let readings = [
+            ("2026-10-27T12:41:44Z", 9, "2026-10-27T17:30:00.324557Z"),
+            ("2026-10-27T12:43:44Z", 10, "2026-10-27T17:30:00.544046Z"),
+            ("2026-10-27T12:45:44Z", 11, "2026-10-27T17:30:00.744046Z"),
+        ];
+        let points = readings.into_iter().map(|(at, used, reset)| serde_json::from_value(json!({
+            "at":at, "windows":[{"id":"five_hour","label":"5 小时用量","used":used,"total":100,"resetAt":reset,"windowDurationMins":300}]
+        })).unwrap()).collect::<Vec<Observation>>();
+        let mut snapshot: UsageSnapshot = serde_json::from_value(json!({
+            "provider":"claude","planName":"Claude","subscriptionExpiresAt":"",
+            "windows":points.last().unwrap().windows,"tokenUsage":empty_token_usage(),
+            "creditsRemaining":0,"creditsTotal":0,"resets":[],"updatedAt":readings[2].0,
+            "sourcePath":"fixture","accountSource":"claudeMod"
+        })).unwrap();
+        let mut history = History::default();
+        history.observations.insert("claude".into(), points);
+        enrich(Path::new("unused"), &mut history, &mut snapshot, &[]).unwrap();
+        assert!(snapshot.cycle_comparisons[0].previous.is_none());
+        assert_eq!(snapshot.cycle_comparisons[0].current.observed_percent, 2.0);
+        assert_eq!(snapshot.windows[0].reset_at, readings[2].2);
+        let first = DateTime::parse_from_rfc3339(readings[0].2).unwrap().with_timezone(&Utc);
+        let last = DateTime::parse_from_rfc3339(readings[2].2).unwrap().with_timezone(&Utc);
+        assert!(!same_cycle_end(first, last, "codex"));
+    }
 
     fn sample(at: &str) -> TokenUsageSample {
         TokenUsageSample {
