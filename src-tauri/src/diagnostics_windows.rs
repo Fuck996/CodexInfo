@@ -75,7 +75,12 @@ fn dock_health(hwnd: HWND) -> Result<(DockHealth, RECT), String> {
     let mut bounds = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut bounds) }.map_err(|error| error.to_string())?;
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-        return Ok((DockHealth::Hidden, bounds));
+        let state = if crate::dock_hwnd_monitor_has_fullscreen_window(hwnd) {
+            DockHealth::YieldingFullscreen
+        } else {
+            DockHealth::Hidden
+        };
+        return Ok((state, bounds));
     }
     let mut cloaked = 0u32;
     unsafe {

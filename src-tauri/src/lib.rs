@@ -52,7 +52,7 @@ use windows::{
             FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetShellWindow,
             GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic,
             IsWindowVisible, SetWindowPos, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
-            GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, MSG,
+            GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_TOP, HWND_TOPMOST, MSG,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT,
             WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
         },
@@ -1456,7 +1456,9 @@ fn configure_dock_window_style(window: &WebviewWindow) {
 
 fn show_dock_window(window: &WebviewWindow) {
     configure_dock_window_style(window);
-    let _ = window.show();
+    if let Err(error) = window.show() {
+        diagnostics::dock_status("show_failed", &error.to_string());
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1678,50 +1680,40 @@ mod dock_z_order_tests {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn lower_dock_window(window: &WebviewWindow) -> bool {
-    let Ok(hwnd) = window.hwnd() else {
-        return false;
-    };
-    lower_dock_hwnd(hwnd)
-}
-
-#[cfg(target_os = "windows")]
-fn lower_dock_hwnd(hwnd: HWND) -> bool {
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(HWND_BOTTOM),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-        .is_ok()
-    }
-}
-
 #[cfg(not(target_os = "windows"))]
 fn dock_monitor_has_fullscreen_window(_: &WebviewWindow) -> bool {
     false
 }
 
-#[cfg(not(target_os = "windows"))]
-fn lower_dock_window(_: &WebviewWindow) -> bool {
-    false
-}
-
 fn update_dock_z_order(window: &WebviewWindow, state: &AppState) {
     let is_yielding = state.dock_yielding_to_fullscreen.load(Ordering::Relaxed);
-    if dock_monitor_has_fullscreen_window(window) {
-        if is_yielding || lower_dock_window(window) {
-            state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
-            diagnostics::dock_status("yielding_fullscreen", "");
-        } else {
-            diagnostics::dock_status("yield_failed", "无法降低悬浮窗层级");
+    let visible = match window.is_visible() {
+        Ok(visible) => visible,
+        Err(error) => {
+            diagnostics::dock_status("inspection_failed", &error.to_string());
+            return;
         }
-    } else if (is_yielding || !dock_is_above_taskbar(window))
+    };
+    if dock_monitor_has_fullscreen_window(window) {
+        // 保留置顶资格；降到 HWND_BOTTOM 后，后台进程可能无法恢复层级。
+        if visible {
+            if let Err(error) = window.hide() {
+                diagnostics::dock_status("yield_failed", &error.to_string());
+                return;
+            }
+        }
+        state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
+        diagnostics::dock_status("yielding_fullscreen", "");
+        return;
+    }
+    if !visible {
+        show_dock_window(window);
+        if !window.is_visible().unwrap_or(false) {
+            diagnostics::dock_status("show_failed", "显示调用后悬浮窗仍不可见");
+            return;
+        }
+    }
+    if (is_yielding || !dock_is_above_taskbar(window))
         && keep_dock_window_above_taskbar(window)
     {
         state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
@@ -1935,9 +1927,6 @@ fn update_dock_window(app: &AppHandle, state: &AppState, force: bool) {
             }
         }
 
-        if !visible {
-            show_dock_window(&window);
-        }
         update_dock_z_order(&window, state);
         if state.hover_component_visible.load(Ordering::Relaxed) {
             if let Some(main) = app.get_webview_window("main") { position_hover_component(app, &main); }
