@@ -52,7 +52,7 @@ use windows::{
             FindWindowExW, FindWindowW, GetClassNameW, GetMessageW, GetShellWindow,
             GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic,
             IsWindowVisible, SetWindowPos, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
-            GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, MSG,
+            GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, MSG,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINEVENT_OUTOFCONTEXT,
             WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
         },
@@ -1461,31 +1461,25 @@ fn show_dock_window(window: &WebviewWindow) {
 
 #[cfg(target_os = "windows")]
 fn keep_dock_window_above_taskbar(window: &WebviewWindow) -> bool {
-    if window.set_always_on_top(true).is_err() {
+    if let Err(error) = window.set_always_on_top(true) {
+        diagnostics::dock_status("restore_failed", &error.to_string());
         return false;
     }
     let Ok(hwnd) = window.hwnd() else {
         return false;
     };
-    keep_dock_hwnd_above_taskbar(hwnd)
+    match keep_dock_hwnd_above_taskbar(hwnd) {
+        Ok(()) => true,
+        Err(error) => {
+            diagnostics::dock_status("restore_failed", &error);
+            false
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
-fn keep_dock_hwnd_above_taskbar(hwnd: HWND) -> bool {
+fn keep_dock_hwnd_above_taskbar(hwnd: HWND) -> Result<(), String> {
     unsafe {
-        if SetWindowPos(
-            hwnd,
-            Some(HWND_NOTOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-        .is_err()
-        {
-            return false;
-        }
         SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -1495,7 +1489,23 @@ fn keep_dock_hwnd_above_taskbar(hwnd: HWND) -> bool {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         )
-        .is_ok()
+        .map_err(|error| error.to_string())?;
+        // 置顶属性不保证同组窗口顺序；显式提升后还要回读任务栏层级。
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if dock_hwnd_is_above_taskbar(hwnd) {
+        Ok(())
+    } else {
+        Err("置顶调用完成后悬浮窗仍在任务栏后方".into())
     }
 }
 
@@ -1551,7 +1561,9 @@ fn dock_hwnd_monitor_has_fullscreen_window(dock: HWND) -> bool {
             return false;
         }
         let shell = GetShellWindow();
-        let taskbar = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok();
+        let taskbar = taskbar_windows().into_iter().find(|taskbar| {
+            MonitorFromWindow(*taskbar, MONITOR_DEFAULTTONEAREST) == dock_monitor
+        });
         let Ok(mut current) = GetTopWindow(None) else {
             return false;
         };
@@ -1703,13 +1715,19 @@ fn lower_dock_window(_: &WebviewWindow) -> bool {
 fn update_dock_z_order(window: &WebviewWindow, state: &AppState) {
     let is_yielding = state.dock_yielding_to_fullscreen.load(Ordering::Relaxed);
     if dock_monitor_has_fullscreen_window(window) {
-        if !is_yielding && lower_dock_window(window) {
+        if is_yielding || lower_dock_window(window) {
             state.dock_yielding_to_fullscreen.store(true, Ordering::Relaxed);
+            diagnostics::dock_status("yielding_fullscreen", "");
+        } else {
+            diagnostics::dock_status("yield_failed", "无法降低悬浮窗层级");
         }
     } else if (is_yielding || !dock_is_above_taskbar(window))
         && keep_dock_window_above_taskbar(window)
     {
         state.dock_yielding_to_fullscreen.store(false, Ordering::Relaxed);
+        diagnostics::dock_status("above_taskbar", "");
+    } else if dock_is_above_taskbar(window) {
+        diagnostics::dock_status("above_taskbar", "");
     }
 }
 

@@ -13,7 +13,11 @@ use windows::{
     core::{BOOL, HRESULT},
     Win32::{
         Foundation::{
-            CloseHandle, FILETIME, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+            CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+        },
+        Graphics::{
+            Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
+            Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
         },
         System::{
             JobObjects::{
@@ -30,8 +34,8 @@ use windows::{
             },
         },
         UI::WindowsAndMessaging::{
-            EnumWindows, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
-            SMTO_BLOCK, SMTO_ERRORONEXIT, WM_NULL,
+            EnumWindows, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+            SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, WM_NULL,
         },
     },
 };
@@ -48,8 +52,73 @@ struct MonitorReady {
 
 #[derive(Clone, PartialEq, Eq)]
 enum SampleHealth {
-    Windows { unresponsive: usize },
+    Windows {
+        unresponsive: usize,
+        dock: DockHealth,
+    },
     Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DockHealth {
+    Missing,
+    Hidden,
+    Cloaked,
+    Offscreen,
+    NoTaskbar,
+    AboveTaskbar,
+    BehindTaskbar,
+    YieldingFullscreen,
+}
+
+fn dock_health(hwnd: HWND) -> Result<(DockHealth, RECT), String> {
+    let mut bounds = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut bounds) }.map_err(|error| error.to_string())?;
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return Ok((DockHealth::Hidden, bounds));
+    }
+    let mut cloaked = 0u32;
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            size_of::<u32>() as u32,
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    if cloaked != 0 {
+        return Ok((DockHealth::Cloaked, bounds));
+    }
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetMonitorInfoW(monitor, &mut info) }
+        .ok()
+        .map_err(|error| error.to_string())?;
+    if bounds.left < info.rcMonitor.left
+        || bounds.top < info.rcMonitor.top
+        || bounds.right > info.rcMonitor.right
+        || bounds.bottom > info.rcMonitor.bottom
+    {
+        return Ok((DockHealth::Offscreen, bounds));
+    }
+    if !crate::taskbar_windows()
+        .into_iter()
+        .any(|bar| unsafe { MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST) } == monitor)
+    {
+        return Ok((DockHealth::NoTaskbar, bounds));
+    }
+    let health = if crate::dock_hwnd_is_above_taskbar(hwnd) {
+        DockHealth::AboveTaskbar
+    } else if crate::dock_hwnd_monitor_has_fullscreen_window(hwnd) {
+        DockHealth::YieldingFullscreen
+    } else {
+        DockHealth::BehindTaskbar
+    };
+    Ok((health, bounds))
 }
 
 #[derive(Default)]
@@ -296,7 +365,16 @@ fn sample(process: &Process, pid: u32) -> Result<(String, SampleHealth), String>
     }
     .map_err(|error| error.to_string())?;
     let mut unresponsive = 0;
+    let mut dock = DockHealth::Missing;
+    let mut dock_bounds = None;
     for hwnd in &probe.windows {
+        let mut title = [0u16; 128];
+        let length = unsafe { GetWindowTextW(*hwnd, &mut title) } as usize;
+        if String::from_utf16_lossy(&title[..length]) == "Codex Usage Dock" {
+            let (health, bounds) = dock_health(*hwnd)?;
+            dock = health;
+            dock_bounds = Some((bounds.left, bounds.top, bounds.right, bounds.bottom));
+        }
         let result = unsafe {
             SendMessageTimeoutW(
                 *hwnd,
@@ -312,10 +390,10 @@ fn sample(process: &Process, pid: u32) -> Result<(String, SampleHealth), String>
             unresponsive += 1;
         }
     }
-    let event = format!("heartbeat target_pid={pid} private_bytes={} working_set_bytes={} handles={handles} gdi={} user={} windows={} unresponsive_windows={unresponsive}",
+    let event = format!("heartbeat target_pid={pid} private_bytes={} working_set_bytes={} handles={handles} gdi={} user={} windows={} unresponsive_windows={unresponsive} dock_state={dock:?} dock_bounds={dock_bounds:?}",
         memory.PrivateUsage, memory.WorkingSetSize, unsafe { GetGuiResources(process.0, GR_GDIOBJECTS) },
         unsafe { GetGuiResources(process.0, GR_USEROBJECTS) }, probe.windows.len());
-    Ok((event, SampleHealth::Windows { unresponsive }))
+    Ok((event, SampleHealth::Windows { unresponsive, dock }))
 }
 
 pub(super) fn monitor_cli(args: Vec<OsString>) -> Result<(), String> {
@@ -476,7 +554,10 @@ mod tests {
     fn healthy_samples_write_every_ten_minutes_but_health_changes_write_immediately() {
         let mut schedule = SampleSchedule::default();
         let start = Instant::now();
-        let healthy = SampleHealth::Windows { unresponsive: 0 };
+        let healthy = SampleHealth::Windows {
+            unresponsive: 0,
+            dock: DockHealth::AboveTaskbar,
+        };
         assert!(schedule.should_write(start, healthy.clone()));
         for seconds in (30..600).step_by(30) {
             assert!(!schedule.should_write(start + Duration::from_secs(seconds), healthy.clone()));
@@ -484,16 +565,47 @@ mod tests {
         assert!(schedule.should_write(start + Duration::from_secs(600), healthy.clone()));
         assert!(schedule.should_write(
             start + Duration::from_secs(630),
-            SampleHealth::Windows { unresponsive: 1 }
+            SampleHealth::Windows {
+                unresponsive: 1,
+                dock: DockHealth::AboveTaskbar
+            }
         ));
         assert!(!schedule.should_write(
             start + Duration::from_secs(660),
-            SampleHealth::Windows { unresponsive: 1 }
+            SampleHealth::Windows {
+                unresponsive: 1,
+                dock: DockHealth::AboveTaskbar
+            }
         ));
         assert!(schedule.should_write(start + Duration::from_secs(690), healthy));
         assert!(schedule.should_write(
             start + Duration::from_secs(720),
             SampleHealth::Error("access denied".into())
+        ));
+    }
+
+    #[test]
+    fn responsive_but_occluded_dock_is_logged_without_waiting_for_healthy_summary() {
+        let mut schedule = SampleSchedule::default();
+        let start = Instant::now();
+        let sample = |dock| SampleHealth::Windows {
+            unresponsive: 0,
+            dock,
+        };
+        assert!(schedule.should_write(start, sample(DockHealth::AboveTaskbar)));
+        assert!(schedule.should_write(start + SAMPLE_INTERVAL, sample(DockHealth::BehindTaskbar)));
+        assert!(!schedule.should_write(
+            start + SAMPLE_INTERVAL * 2,
+            sample(DockHealth::BehindTaskbar)
+        ));
+        assert!(schedule.should_write(
+            start + SAMPLE_INTERVAL * 3,
+            sample(DockHealth::AboveTaskbar)
+        ));
+        assert!(schedule.should_write(start + SAMPLE_INTERVAL * 4, sample(DockHealth::Offscreen)));
+        assert!(schedule.should_write(
+            start + SAMPLE_INTERVAL * 5,
+            sample(DockHealth::YieldingFullscreen)
         ));
     }
 

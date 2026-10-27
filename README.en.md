@@ -122,6 +122,8 @@ Each widget run starts an independent monitor. It records the process exit code 
 
 Logs are stored in `%LOCALAPPDATA%\net.local.codex-info\logs`: `lifecycle.log` contains runtime events; `monitor-<PID>-<creation-time>.log` contains samples and the final exit code; its `.json` file records the run phase and exit intent. Each segment is capped at 512 KiB with one previous segment; oversized entries are explicitly marked as truncated. Diagnostic files have an 8 MiB total budget. At most 12 completed runs are retained for up to 7 days; the oldest runs are removed sooner if necessary to meet the budget. Every write checks retention under a cross-process directory lock, including files left by incomplete startups. PID and creation time identify active processes, so stale ready markers do not prevent cleanup. Writes fail explicitly if active records exhaust the budget. Logging does not force a disk sync per entry. A failed monitor launch is explicitly logged as `monitor_start_failed`.
 
+Window checks also record dock bounds, hidden and offscreen states, taskbar occlusion, and fullscreen yielding, distinguishing a process exit from a running but obscured widget. The main process writes `dock_state` only on layer state changes and verifies the actual order after restoring the dock. When a fullscreen app on the same monitor closes, the dock returns above the taskbar. These records use the same throttling and storage limits.
+
 Logs stay local. Review error text and local paths before sharing them. An exit code identifies the termination result but does not necessarily identify which program terminated the process.
 
 ## Privacy

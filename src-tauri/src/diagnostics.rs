@@ -21,6 +21,7 @@ const MAX_RUN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ERROR_INTERVAL: Duration = Duration::from_secs(60);
 static LOG_FILE: OnceLock<Mutex<RollingLog>> = OnceLock::new();
 static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
+static DOCK_STATUS: Mutex<Option<String>> = Mutex::new(None);
 static FRONTEND_ERRORS: Mutex<ErrorBatch> = Mutex::new(ErrorBatch {
     last_written: None,
     pending: 0,
@@ -411,6 +412,17 @@ pub fn record(event: &str) {
             }
         }
         Err(error) => eprintln!("诊断日志锁异常: {error}; {event}"),
+    }
+}
+
+pub fn dock_status(state: &str, detail: &str) {
+    match DOCK_STATUS.lock() {
+        Ok(mut previous) if previous.as_deref() != Some(state) => {
+            record(&format!("dock_state state={state} {detail}"));
+            *previous = Some(state.into());
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("悬浮窗诊断锁异常: {error}"),
     }
 }
 
