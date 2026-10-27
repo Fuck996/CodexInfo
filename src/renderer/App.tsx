@@ -252,7 +252,6 @@ export function App() {
     setLoading(true);
     setError("");
     setCodexConnected(false);
-    setTokenExpanded(false);
 
     function applySnapshot(usage: UsageSnapshot, connected?: boolean) {
       setSnapshot(usage);
@@ -320,7 +319,7 @@ export function App() {
     ? resetDetailBaseExtraHeight + resetDetailRowExtraHeight * Math.min(sortedResets.length, 12)
     : 0) + (tokenExpanded ? apiCostPanelExtraHeight : 0);
   const statusClass = codexConnected ? "is-connected" : loading ? "is-loading" : "is-offline";
-  const statusTitle = codexConnected ? (provider === "claude" ? "Claude Code 会话快照" : "Codex 已连接") : loading ? `正在读取 ${providerName}` : `${providerName} 数据未更新`;
+  const statusTitle = codexConnected ? (provider === "claude" ? "Claude 账号额度已同步" : "Codex 已连接") : loading ? `正在读取 ${providerName}` : `${providerName} 数据未更新`;
 
   useEffect(() => {
     if (!canExpand) {
@@ -376,7 +375,7 @@ export function App() {
             <strong className="brand-title"><span>{providerName.toUpperCase()}</span><em>用量核心</em></strong>
           </div>
           <div className="plan-meta">
-            <span className="plan-badge">{provider === "claude" ? "会话用量" : compactPlanName(snapshot?.planName)}</span>
+            <span className="plan-badge">{provider === "claude" ? "账号用量" : compactPlanName(snapshot?.planName)}</span>
           </div>
         </div>
 
@@ -401,7 +400,7 @@ export function App() {
             <UsageAnalytics expanded={tokenExpanded} onToggle={toggleTokenExpanded} snapshot={snapshot} />
 
             {provider === "claude" ? (
-              <div className="claude-source-note"><strong>来自 Claude Code 会话</strong><p>最近读数：{formatFullDate(snapshot.updatedAt)}</p><p>用量随会话更新。窗口到期后等待新读数。</p><p>银行重置余额：官方 Mods 接口尚未提供。</p></div>
+              <div className="claude-source-note"><strong>Claude 账号额度</strong><p>最近同步：{formatFullDate(snapshot.updatedAt)}</p><p>在线 Code 桥接每 2 分钟查询账号额度，包含 Projects 等入口的消耗。关闭全部 Code 会话后同步暂停。</p><p>Token 明细仅统计已接入的 Code 请求。</p><p>银行重置余额：尚未提供。</p></div>
             ) : canExpand ? (
               <ResetOverview
                 resets={sortedResets}

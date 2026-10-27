@@ -2304,7 +2304,7 @@ fn expanded_position_anchor(
 ) -> Option<tauri::PhysicalPosition<i32>> {
     let current_position = window.outer_position().ok()?;
     let current_size = window.outer_size().ok()?;
-    let monitor = app.primary_monitor().ok().flatten()?;
+    let monitor = target_monitor(app)?;
     let work_area = monitor.work_area();
     let monitor_position = monitor.position();
     let edge_gap = (DOCK_EDGE_GAP * monitor.scale_factor()).round() as i32;
@@ -2320,15 +2320,34 @@ fn expanded_position_anchor(
         .x
         .max(work_left + edge_gap)
         .min((work_right - target_width - edge_gap).max(work_left + edge_gap));
-    let y = if top_taskbar {
-        current_position.y.max(work_top + edge_gap)
-    } else {
-        let current_bottom = current_position.y + current_size.height as i32;
-        (current_bottom - target_height).max(work_top + edge_gap)
-    }
-    .min((work_bottom - target_height).max(work_top + edge_gap));
+    let hover_owned = app.state::<AppState>().hover_component_visible.load(Ordering::Relaxed);
+    let y = popup_resize_top(current_position.y, current_position.y + current_size.height as i32,
+        target_height, work_top + edge_gap, work_bottom, top_taskbar || hover_owned);
 
     Some(tauri::PhysicalPosition::new(x, y))
+}
+
+fn popup_resize_top(top: i32, bottom: i32, height: i32, work_top: i32, work_bottom: i32, keep_top: bool) -> i32 {
+    let anchor = if keep_top { top } else { bottom - height };
+    anchor.clamp(work_top, (work_bottom - height).max(work_top))
+}
+
+#[cfg(test)]
+mod popup_position_tests {
+    use super::popup_resize_top;
+
+    #[test]
+    fn collapsing_an_interactive_popup_keeps_its_header_under_the_pointer() {
+        assert_eq!(popup_resize_top(583, 1392, 470, 4, 1392, true), 583);
+        assert_eq!(popup_resize_top(583, 1392, 470, 4, 1392, false), 922);
+    }
+
+    #[test]
+    fn expansion_and_negative_monitor_coordinates_stay_inside_work_area() {
+        assert_eq!(popup_resize_top(922, 1392, 809, 4, 1392, true), 583);
+        assert_eq!(popup_resize_top(-857, -48, 470, -1436, -48, true), -857);
+        assert_eq!(popup_resize_top(-518, -48, 809, -1436, -48, true), -857);
+    }
 }
 
 #[tauri::command]
@@ -2443,6 +2462,12 @@ fn hover_component_position(app: &AppHandle, window: &WebviewWindow) -> Option<t
 }
 
 fn position_hover_component(app: &AppHandle, window: &WebviewWindow) {
+    let interacting = app.state::<AppState>().hover_component_visible.load(Ordering::Relaxed)
+        && window.is_visible().unwrap_or(false) && cursor_inside_window(app, "main");
+    if interacting && window.current_monitor().ok().flatten().zip(target_monitor(app))
+        .is_some_and(|(current, target)| current.name() == target.name()) {
+        return;
+    }
     if let Some(position) = hover_component_position(app, window) {
         let _ = window.set_position(position);
     }
@@ -2502,15 +2527,19 @@ fn start_hover_monitor(app: AppHandle, state: AppState) {
     }
 
     thread::spawn(move || {
+        let mut outside_since: Option<Instant> = None;
         loop {
             thread::sleep(Duration::from_millis(120));
             if !state.hover_component_visible.load(Ordering::Relaxed) {
                 break;
             }
-            if state.settings_open.load(Ordering::Relaxed) { continue; }
-            if cursor_inside_hover_area(&app) {
+            if state.settings_open.load(Ordering::Relaxed) || cursor_inside_hover_area(&app) {
+                outside_since = None;
                 continue;
             }
+            let since = outside_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < Duration::from_millis(180) { continue; }
+            diagnostics::record("hover_dismiss reason=pointer_left");
             hide_main_component(&app, &state);
             break;
         }
@@ -2519,14 +2548,9 @@ fn start_hover_monitor(app: AppHandle, state: AppState) {
 }
 
 fn hide_hover_component_if_idle(app: AppHandle, state: AppState) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(180));
-        let hover_owned = state.hover_component_visible.load(Ordering::Relaxed);
-        if cursor_inside_hover_area(&app) || !hover_owned || state.settings_open.load(Ordering::Relaxed) {
-            return;
-        }
-        hide_main_component(&app, &state);
-    });
+    if state.hover_component_visible.load(Ordering::Relaxed) {
+        start_hover_monitor(app, state);
+    }
 }
 
 fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {

@@ -1,4 +1,62 @@
+async function synchronize($, state) {
+  if (state.inFlight || state.stopped) return;
+  state.inFlight = true;
+  let claimed = false;
+  try {
+    const config = JSON.parse(await $.fs.read(`${$.plugin.root}/bridge.json`));
+    const result = await $.process.run([config.executable, "--claude-poll-claim", config.directory], { timeoutMs: 5000 });
+    if (result.exitCode !== 0) throw new Error(`账号查询限频失败：${result.stderr}`);
+    const lease = JSON.parse(result.stdout);
+    if (typeof lease.granted !== "boolean") throw new Error("账号查询限频响应无效");
+    if (!lease.granted) return;
+    claimed = true;
+    const authorization = await $.session.authorize();
+    if (!authorization || authorization.kind !== "bearer") throw new Error("当前 Code 会话没有 Claude 订阅授权");
+    const response = await $.http.fetch("https://api.anthropic.com/api/oauth/usage", {
+      auth: authorization.handle,
+      headers: { "anthropic-beta": "oauth-2025-04-20" }
+    });
+    if (!response.ok) throw new QuotaReadError(`Claude 账号用量查询失败（HTTP ${response.status}）`, retryDelay(response));
+    let body;
+    try { body = JSON.parse(response.text); }
+    catch { throw new Error("Claude 账号用量响应不是有效 JSON"); }
+    const rateLimits = quotaWindows(body);
+    if (!state.stopped) await exportReading($, {
+      type: "reading", source: "account",
+      sessionId: await fileIdentifier(await $.session.id()),
+      updatedAt: new Date().toISOString(), rateLimits
+    });
+  } catch (error) {
+    if (!claimed || state.stopped) throw error;
+    await exportReading($, {
+      type: "syncFailure", updatedAt: new Date().toISOString(),
+      message: error instanceof Error ? error.message : String(error),
+      retryAfterSecs: error instanceof QuotaReadError ? error.retryAfterSecs : 120
+    });
+  } finally { state.inFlight = false; }
+}
+
+function tick($, state) {
+  void synchronize($, state).catch((error) => $.ui.log(`CodexInfo 同步失败：${error instanceof Error ? error.message : String(error)}`));
+}
+
 export function register(on) {
+  const state = { timer: undefined, stopped: false, inFlight: false };
+  on("session.start", async ($, event, next) => {
+    const result = await next(event);
+    state.stopped = false;
+    state.timer?.cancel();
+    state.timer = $.clock.every(120_000, () => tick($, state));
+    tick($, state);
+    return result;
+  });
+  on("session.end", async ($, event, next) => {
+    if (event.reason === "clear" || event.reason === "resume") return next(event);
+    state.stopped = true;
+    state.timer?.cancel();
+    state.timer = undefined;
+    return next(event);
+  });
   on("turn.step", async function* ($, event, next) {
     const result = yield* next(event);
     if (result.usage) {
@@ -11,16 +69,37 @@ export function register(on) {
     }
     return result;
   });
-  on("session.measure", async ($, event, next) => {
-    const result = await next(event);
-    await exportReading($, {
-      type: "reading",
-      sessionId: await fileIdentifier(await $.session.id()),
-      updatedAt: new Date().toISOString(),
-      rateLimits: event.rateLimits
-    });
-    return result;
-  });
+}
+
+class QuotaReadError extends Error {
+  constructor(message, retryAfterSecs) {
+    super(message);
+    this.retryAfterSecs = retryAfterSecs;
+  }
+}
+
+function retryDelay(response) {
+  const value = response.headers["retry-after"];
+  const seconds = value && /^\d+$/.test(value) ? Number(value) : (Date.parse(value) - Date.now()) / 1000;
+  if (Number.isFinite(seconds) && seconds > 0) return Math.max(120, Math.ceil(seconds));
+  return response.status === 429 ? 600 : 120;
+}
+
+function quotaWindows(body) {
+  if (!body || typeof body !== "object") throw new Error("Claude 账号用量结构无效");
+  const windows = [];
+  for (const kind of ["five_hour", "seven_day"]) {
+    const value = body[kind];
+    if (value === null || value === undefined) continue;
+    if (typeof value !== "object" || !Number.isFinite(value.utilization)
+        || value.utilization < 0 || value.utilization > 100
+        || typeof value.resets_at !== "string" || !Number.isFinite(Date.parse(value.resets_at))) {
+      throw new Error(`Claude ${kind} 额度字段无效`);
+    }
+    windows.push({ kind, percentUsed: value.utilization, resetsAt: value.resets_at });
+  }
+  if (!windows.length) throw new Error("Claude 账号接口未返回有效额度窗口");
+  return windows;
 }
 
 async function fileIdentifier(value) {

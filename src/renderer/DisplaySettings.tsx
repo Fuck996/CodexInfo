@@ -85,8 +85,8 @@ export function DisplaySettings({ settings, onChange, onClose }: {
           {[5, 10, 30, 60].map((seconds) => <option key={seconds} value={seconds}>每 {seconds} 秒</option>)}
         </select>
         <div className="claude-connection">
-          <strong>Claude Code 接入</strong>
-          <p>安装本地用量插件，支持桌面版 Code 页和终端版。只导出用量与重置时间，不读取聊天内容或登录令牌。</p>
+          <strong>Claude 账号用量桥接</strong>
+          <p>通过在线 Code 会话每 2 分钟同步账号额度，包含 Projects 的消耗。更新后执行 /reload-plugins；只导出用量与重置时间，授权由 Claude 持有。</p>
           <button className="connect-button" disabled={connecting} onClick={() => void connect()}>{connecting ? "正在接入…" : "接入 Claude Code"}</button>
         </div>
         {saving && <p role="status">正在保存…</p>}

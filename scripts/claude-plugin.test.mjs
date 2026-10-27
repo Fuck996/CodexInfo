@@ -1,31 +1,114 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setImmediate, setTimeout } from "node:timers/promises";
 import { register } from "../claude-plugin/hooks/register.js";
+
+async function waitForExport(exports, count) {
+  const deadline = Date.now() + 1000;
+  while (exports.length < count && Date.now() < deadline) await setTimeout(1);
+  assert.equal(exports.length, count);
+}
 
 function harness() {
   const handlers = new Map();
   const exports = [];
+  const requests = [];
+  const logs = [];
+  let tick;
+  let cancelled = false;
   register((event, handler) => handlers.set(event, handler));
   const api = {
     plugin: { root: "plugin" },
-    session: { id: async () => "session:opaque/id" },
+    session: { id: async () => "session:opaque/id", authorize: async () => ({ handle: "opaque-handle", kind: "bearer" }) },
+    clock: { every: (ms, callback) => { assert.equal(ms, 120_000); tick = callback; return { cancel: () => { cancelled = true; } }; } },
+    ui: { log: (message) => logs.push(message) },
+    http: { fetch: async (url, init) => {
+      requests.push({ url, init });
+      return { ok: true, status: 200, headers: {}, text: JSON.stringify({
+        five_hour: { utilization: 42.5, resets_at: "2027-01-01T05:00:00Z" },
+        seven_day: { utilization: 7, resets_at: "2027-01-07T00:00:00Z" }
+      }) };
+    } },
     fs: { read: async () => JSON.stringify({ executable: "collector.exe", directory: "readings" }) },
     process: { run: async (argv, options) => {
+      if (argv[1] === "--claude-poll-claim") return { exitCode: 0, stdout: '{"granted":true}', stderr: "" };
       exports.push({ argv, reading: JSON.parse(options.stdin) });
       return { exitCode: 0, stdout: "", stderr: "" };
     } }
   };
-  return { api, handlers, exports };
+  return { api, handlers, exports, requests, logs,
+    start: async () => { await handlers.get("session.start")(api, {}, async () => ({})); await setImmediate(); },
+    tick: async () => { tick(); await setImmediate(); },
+    cancelled: () => cancelled
+  };
 }
 
-test("measurement exports only quota metadata and hashes opaque identifiers", async () => {
-  const { api, handlers, exports } = harness();
-  const event = { rateLimits: [{ kind: "five_hour", percentUsed: 25 }], context: { privateText: "not exported" } };
-  const result = { changed: ["rateLimits"] };
-  assert.equal(await handlers.get("session.measure")(api, event, async () => result), result);
-  assert.deepEqual(exports[0].argv, ["collector.exe", "--claude-usage", "readings"]);
-  assert.match(exports[0].reading.sessionId, /^[a-f0-9]{64}$/);
-  assert.deepEqual(Object.keys(exports[0].reading).sort(), ["rateLimits", "sessionId", "type", "updatedAt"]);
+test("idle bridge polls account usage without a model turn or exporting authorization", async () => {
+  const h = harness();
+  await h.start();
+  await waitForExport(h.exports, 1);
+  assert.equal(h.requests[0].url, "https://api.anthropic.com/api/oauth/usage");
+  assert.equal(h.requests[0].init.auth, "opaque-handle");
+  assert.equal(h.exports[0].reading.source, "account");
+  assert.equal(h.exports[0].reading.rateLimits[0].percentUsed, 42.5);
+  assert.match(h.exports[0].reading.sessionId, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(h.exports).includes("opaque-handle"), false);
+  assert.equal(h.handlers.has("session.measure"), false);
+  await h.tick();
+  await waitForExport(h.exports, 2);
+});
+
+test("another session's claim prevents duplicate account requests", async () => {
+  const h = harness();
+  h.api.process.run = async () => ({ exitCode: 0, stdout: '{"granted":false}' });
+  await h.start();
+  await h.tick();
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.exports.length, 0);
+});
+
+test("rate limiting is exported with server retry delay and no stale snapshot", async () => {
+  const h = harness();
+  h.api.http.fetch = async () => ({ ok: false, status: 429, headers: { "retry-after": "700" } });
+  await h.start();
+  assert.equal(h.exports[0].reading.type, "syncFailure");
+  assert.equal(h.exports[0].reading.retryAfterSecs, 700);
+  assert.match(h.exports[0].reading.message, /HTTP 429/);
+});
+
+test("invalid account fields and missing authorization fail explicitly", async () => {
+  const h = harness();
+  h.api.http.fetch = async () => ({ ok: true, text: '{"five_hour":{"utilization":150,"resets_at":"2027-01-01T00:00:00Z"}}' });
+  await h.start();
+  assert.equal(h.exports[0].reading.type, "syncFailure");
+  assert.match(h.exports[0].reading.message, /额度字段无效/);
+  const missing = harness();
+  missing.api.session.authorize = async () => null;
+  await missing.start();
+  assert.match(missing.exports[0].reading.message, /订阅授权/);
+  assert.equal(missing.requests.length, 0);
+});
+
+test("ending session cancels polling and discards outstanding response", async () => {
+  const h = harness();
+  let resolve;
+  h.api.http.fetch = () => new Promise((done) => { resolve = done; });
+  await h.start();
+  await h.handlers.get("session.end")(h.api, {}, async () => ({}));
+  resolve({ ok: true, text: '{"five_hour":{"utilization":10,"resets_at":"2027-01-01T00:00:00Z"}}' });
+  await setImmediate();
+  await h.tick();
+  assert.equal(h.cancelled(), true);
+  assert.equal(h.exports.length, 0);
+});
+
+test("clearing or resuming a conversation keeps the loaded bridge polling", async () => {
+  const h = harness();
+  await h.start();
+  await h.handlers.get("session.end")(h.api, { reason: "clear" }, async () => ({}));
+  await h.tick();
+  assert.equal(h.cancelled(), false);
+  assert.equal(h.requests.length, 2);
 });
 
 test("request observer preserves the original stream and exports usage once", async () => {
@@ -43,7 +126,8 @@ test("request observer preserves the original stream and exports usage once", as
 });
 
 test("collector failures are surfaced instead of reporting a successful export", async () => {
-  const { api, handlers } = harness();
-  api.process.run = async () => ({ exitCode: 1, stderr: "write failed" });
-  await assert.rejects(handlers.get("session.measure")(api, { rateLimits: [] }, async () => ({})), /write failed/);
+  const h = harness();
+  h.api.process.run = async () => ({ exitCode: 1, stderr: "write failed" });
+  await h.start();
+  assert.match(h.logs[0], /write failed/);
 });
