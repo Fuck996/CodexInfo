@@ -1,19 +1,16 @@
 import { ArrowLeftRight, ChevronDown, ChevronUp } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AppSettings, ThemeName, UsageMode, UsageProvider, UsageSnapshot, UsageWindow } from "../shared/types";
 import { desktopApi } from "./desktopApi";
 import { Settings2 } from "lucide-react";
 import { DisplaySettings } from "./DisplaySettings";
-import { UsageAnalytics } from "./UsageAnalytics";
+import { UsageAnalytics, UsageComparison } from "./UsageAnalytics";
 import dockIcon from "./assets/dock-icon.png";
 import claudeIcon from "./assets/claude-icon.png";
 
 const refreshIntervalMs = 5_000;
-const apiCostPanelExtraHeight = 330;
-const resetDetailBaseExtraHeight = 130;
-const resetDetailRowExtraHeight = 42;
 const numberFormatter = new Intl.NumberFormat("zh-CN");
 const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
@@ -202,9 +199,11 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [snapshot, setSnapshot] = useState<UsageSnapshot | null>(null);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
   const [analyticsView, setAnalyticsView] = useState<"cycle" | "providers" | null>(null);
-  const tokenExpanded = analyticsView !== null;
+  const contentRef = useRef<HTMLDivElement>(null);
+  const comparisonRef = useRef<HTMLDivElement>(null);
+  const [contentHeight, setContentHeight] = useState(470);
   const [loading, setLoading] = useState(true);
   const [codexConnected, setCodexConnected] = useState(false);
   const [error, setError] = useState("");
@@ -316,25 +315,30 @@ export function App() {
   const resetCount = snapshot?.resetCredits?.available ?? sortedResets.length;
   const canExpand = resetCount > 0 && sortedResets.length > 0;
   const resetExpanded = expanded && canExpand;
-  const extraHeight = (resetExpanded
-    ? resetDetailBaseExtraHeight + resetDetailRowExtraHeight * Math.min(sortedResets.length, 12)
-    : 0) + (tokenExpanded ? apiCostPanelExtraHeight : 0);
   const statusClass = codexConnected ? "is-connected" : loading ? "is-loading" : "is-offline";
   const statusTitle = codexConnected ? (provider === "claude" ? "Claude 账号额度已同步" : "Codex 已连接") : loading ? `正在读取 ${providerName}` : `${providerName} 数据未更新`;
 
-  useEffect(() => {
-    if (!canExpand) {
-      setExpanded(false);
-    }
-  }, [canExpand]);
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    const measure = () => setContentHeight(Math.ceil(Math.max(
+      content.getBoundingClientRect().height + 2,
+      comparisonRef.current ? comparisonRef.current.getBoundingClientRect().height + 26 : 0
+    )));
+    const observer = new ResizeObserver(measure);
+    observer.observe(content);
+    if (comparisonRef.current) observer.observe(comparisonRef.current);
+    measure();
+    return () => observer.disconnect();
+  }, [analyticsView]);
 
   useEffect(() => {
     if (currentWindowLabel === "main") {
-      void desktopApi.setExpanded(resetExpanded || tokenExpanded, extraHeight).catch((error) => {
+      void desktopApi.setExpanded(contentHeight > 470, Math.max(0, contentHeight - 470)).catch((error) => {
         console.error("调整组件高度失败", error);
       });
     }
-  }, [resetExpanded, tokenExpanded, extraHeight]);
+  }, [contentHeight]);
 
   if (currentWindowLabel === "dock") {
     return <DockBar provider={provider} error={error} loading={loading} snapshot={snapshot} windows={windows} />;
@@ -367,6 +371,7 @@ export function App() {
       onMouseLeave={() => setHoverRegion("main", false)}
     >
       <section className={canExpand ? "widget has-reset-details" : "widget"} aria-label={`${providerName} 用量组件`}>
+        <div className="widget-scroll" role="region" aria-label="用量与重置详情" tabIndex={0} inert={analyticsView !== null || settingsOpen}><div className="widget-content" ref={contentRef}>
         <div className="chrome drag-region" data-tauri-drag-region>
           <div className="brand">
             <span className="brand-icon-wrap" title={statusTitle}>
@@ -402,7 +407,7 @@ export function App() {
               ))}
             </div>
 
-            <UsageAnalytics view={analyticsView} onViewChange={setAnalyticsView} onToggle={toggleTokenExpanded} snapshot={snapshot} />
+            <UsageAnalytics view={analyticsView} onToggle={toggleTokenExpanded} snapshot={snapshot} />
             {snapshot.planError && <div className="data-warning" role="status">套餐：{snapshot.planError}</div>}
 
             {provider === "claude" ? (
@@ -424,12 +429,9 @@ export function App() {
               <ResetDetails resets={sortedResets} availableCount={resetCount} updatedAt={snapshot.updatedAt} />
             )}
           </>
-        ) : (
-          <>
-            <div className="error-panel">{error || "正在读取数据"}</div>
-            <UsageAnalytics view={analyticsView} onViewChange={setAnalyticsView} onToggle={toggleTokenExpanded} snapshot={null} />
-          </>
-        )}
+        ) : <div className="error-panel">{error || "正在读取数据"}</div>}
+        </div></div>
+        <UsageComparison view={analyticsView} onViewChange={setAnalyticsView} snapshot={snapshot} contentRef={comparisonRef} />
 
         {loading && <div className="loading-sheen" />}
         {settingsOpen && settings && <DisplaySettings settings={settings} onChange={setSettings} onClose={() => setSettingsOpen(false)} />}
@@ -540,7 +542,7 @@ function ResetOverview({
             {availableCount}/{totalCount}
           </strong>
         </div>
-        <span className="reset-overview-icon">{expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}</span>
+        <span className="reset-overview-icon">{expanded ? "收起明细" : "查看每次过期时间"}{expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}</span>
       </div>
       <div className="reset-summary-grid">
         <SummaryCard tone="green" label="可用" value={`${availableCount}`} />

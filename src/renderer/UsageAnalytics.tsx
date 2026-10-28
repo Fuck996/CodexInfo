@@ -1,108 +1,197 @@
-import { useEffect, useState } from "react";
-import { ChevronDown, ChevronUp, Database } from "lucide-react";
-import type { CycleSummary, ProviderComparison, ProviderPeriod, UsageSnapshot } from "../shared/types";
+import { useEffect, useRef, useState } from "react";
+import type { RefObject } from "react";
+import { ChevronDown, ChevronUp, Database, X } from "lucide-react";
+import type { CycleSummary, ProviderComparison, UsageSnapshot } from "../shared/types";
 import { desktopApi } from "./desktopApi";
 
+type View = "cycle" | "providers";
+type Metric = "quota" | "tokens" | "cost" | "efficiency";
+type ChartItem = { label: string; value: number | null; upper: number | null; text: string; note?: string };
 const tokens = new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 2 });
-const dollars = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 4 });
+const dollars = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 const date = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+const metricOrder: Metric[] = ["quota", "tokens", "cost", "efficiency"];
+const metrics: Record<Metric, { label: string; title: string; unit: string }> = {
+  quota: { label: "额度消耗", title: "额度消耗", unit: "百分点" },
+  tokens: { label: "Token", title: "Token 总量", unit: "本机记录" },
+  cost: { label: "API 成本", title: "API 等价成本", unit: "美元 · 估算" },
+  efficiency: { label: "单位耗额", title: "每百万 Token 耗额", unit: "百分点 · 越低越省" }
+};
+
+function count(value: number | null | undefined) { return value == null ? "--" : tokens.format(value); }
 function cost(low: number | null | undefined, high: number | null | undefined) {
   if (low == null || high == null) return "--";
-  return Math.abs(low - high) < 0.00005 ? dollars.format(low) : `${dollars.format(low)}–${dollars.format(high)}`;
+  const first = dollars.format(low);
+  const last = dollars.format(high);
+  return first === last ? first : `${first}–${last}`;
 }
-function count(value: number | null | undefined) { return value == null ? "--" : tokens.format(value); }
 function cycleCost(cycle: CycleSummary | null | undefined) {
-  if (!cycle) return "--";
+  if (!cycle || cycle.sampleCount === 0) return "--";
   if (cycle.costLowUsd != null) return cost(cycle.costLowUsd, cycle.costHighUsd);
   return (cycle.pricedSampleCount ?? 0) > 0 ? `${cost(cycle.pricedCostLowUsd, cycle.pricedCostHighUsd)}（部分）` : "--";
 }
 function range(cycle: CycleSummary | null | undefined) {
-  return cycle ? `${date.format(new Date(cycle.startAt))} — ${date.format(new Date(cycle.endAt))}` : "尚无历史窗口";
+  return cycle ? `${date.format(new Date(cycle.startAt))} — ${date.format(new Date(cycle.endAt))}` : "暂无记录";
 }
 
-export function UsageAnalytics({ snapshot, view, onViewChange, onToggle }: {
-  snapshot: UsageSnapshot | null;
-  view: "cycle" | "providers" | null;
-  onViewChange: (view: "cycle" | "providers") => void;
-  onToggle: () => void;
+export function UsageAnalytics({ snapshot, view, onToggle }: {
+  snapshot: UsageSnapshot; view: View | null; onToggle: () => void;
 }) {
-  const [windowId, setWindowId] = useState<string | null>(null);
-  const expanded = view !== null;
-  const crossProvider = view === "providers";
-  const comparisons = snapshot?.cycleComparisons ?? [];
-  const selected = comparisons.find((item) => item.windowId === windowId) ?? comparisons[comparisons.length - 1];
-  const current = selected?.current;
-  const previous = selected?.previous;
-  const cycleTokenCount = current && current.sampleCount > 0 ? current.tokenUsage.total : null;
-  const rows: Array<{label: string; value: (cycle: CycleSummary) => string}> = [
-    { label: "Token 总量", value: (cycle) => cycle.sampleCount > 0 ? count(cycle.tokenUsage.total) : "未采集" },
-    { label: "输入 / 缓存读取", value: (cycle) => cycle.sampleCount > 0 ? `${count(cycle.tokenUsage.input)} / ${count(cycle.tokenUsage.cachedInput)}` : "--" },
-    { label: "输出", value: (cycle) => cycle.sampleCount > 0 ? count(cycle.tokenUsage.output) : "--" },
-    { label: "缓存写入", value: (cycle) => cycle.sampleCount > 0 ? count(cycle.cacheWriteTokens) : "--" },
-    { label: "API 等价成本", value: cycleCost },
-    { label: "已观察额度消耗", value: (cycle) => cycle.observedFrom && cycle.observedFrom !== cycle.observedUntil ? `${cycle.observedPercent.toFixed(1)}%` : "采样不足" },
+  const comparisons = snapshot.cycleComparisons ?? [];
+  const current = comparisons[comparisons.length - 1]?.current;
+  const total = current && current.sampleCount > 0 ? current.tokenUsage.total : null;
+  return <div className="token-section"><div className="token-summary-grid">
+    <button className={view === "cycle" ? "token-block is-expanded" : "token-block"} onClick={onToggle} aria-expanded={view === "cycle"}>
+      <div className="token-title"><Database size={16} /><span>本周期 Token</span></div>
+      <div className="token-total">{count(total)}</div>
+      <div className="token-metrics"><span><small>输入</small><strong>{total == null ? "--" : count(current?.tokenUsage.input)}</strong></span><span><small>输出</small><strong>{total == null ? "--" : count(current?.tokenUsage.output)}</strong></span></div>
+    </button>
+    <button className={view === "cycle" ? "api-summary-card is-expanded" : "api-summary-card"} onClick={onToggle} aria-expanded={view === "cycle"}>
+      <div className="api-summary-head"><span>API 等价成本</span>{view === "cycle" ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</div>
+      <strong className={current?.unknownPriceModels.length ? "has-price-gap" : ""} title={cycleCost(current)}>{cycleCost(current)}</strong>
+      <small>{current?.unknownPriceModels.length ? "部分请求尚无公开单价" : "点击查看周期图表"}</small>
+    </button>
+  </div></div>;
+}
+
+export function UsageComparison({ snapshot, view, onViewChange, contentRef }: {
+  snapshot: UsageSnapshot | null; view: View | null; onViewChange: (view: View | null) => void;
+  contentRef: RefObject<HTMLDivElement | null>;
+}) {
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const open = view !== null;
+  useEffect(() => {
+    if (!open) return;
+    const previousFocus = document.activeElement;
+    closeButton.current?.focus();
+    return () => { if (previousFocus instanceof HTMLElement) previousFocus.focus(); };
+  }, [open]);
+  if (!view) return null;
+  return <div className="comparison-scrim" onClick={() => onViewChange(null)}>
+  <section id="usage-comparison-panel" className="cycle-panel" role="dialog" aria-modal="true" aria-labelledby="comparison-title"
+    onClick={(event) => event.stopPropagation()} onKeyDown={(event) => {
+      if (event.key === "Escape") onViewChange(null);
+      if (event.key === "Tab") {
+        const controls = event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), summary");
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      }
+    }}><div ref={contentRef} className="comparison-content">
+    <header className="comparison-head"><strong id="comparison-title">用量对比</strong><button ref={closeButton} onClick={() => onViewChange(null)} aria-label="关闭用量对比"><X size={18} /></button></header>
+    <div className="analytics-view-tabs" role="group" aria-label="对比方式">
+      <button aria-pressed={view === "cycle"} onClick={() => onViewChange("cycle")}>本周期 / 上周期</button>
+      <button aria-pressed={view === "providers"} onClick={() => onViewChange("providers")}>Codex / Claude</button>
+    </div>
+    {view === "providers" ? <CrossProviderComparison /> : <CycleChart snapshot={snapshot} />}
+  </div></section></div>;
+}
+
+function item(label: string, cycle: CycleSummary | null | undefined, metric: Metric, efficiency?: number | null): ChartItem {
+  if (!cycle) return { label, value: null, upper: null, text: "暂无记录" };
+  let value: number | null = null;
+  let upper: number | null = null;
+  let text = "未记录";
+  let note: string | undefined;
+  if (metric === "quota") {
+    const observed = cycle.observedFrom && cycle.observedFrom !== cycle.observedUntil;
+    if (observed && cycle.quotaDrops === 0) { value = cycle.observedPercent; text = `${value.toFixed(1)}%`; }
+    else text = cycle.quotaDrops ? "有额度回落" : "采样不足";
+  } else if (metric === "tokens") {
+    if (cycle.sampleCount > 0) { value = cycle.tokenUsage.total ?? null; text = count(value); }
+    else text = "无 Token 记录";
+  } else if (metric === "cost") {
+    if (cycle.sampleCount > 0) {
+      value = cycle.costLowUsd ?? cycle.pricedCostLowUsd ?? null;
+      upper = cycle.costHighUsd ?? cycle.pricedCostHighUsd ?? null;
+      text = cost(value, upper);
+      if (cycle.costLowUsd == null && value != null) note = "部分";
+    }
+  } else {
+    value = efficiency !== undefined ? efficiency : cycle.tokensPerPercent ? 1_000_000 / cycle.tokensPerPercent : null;
+    text = value == null ? "无法计算" : `${value.toFixed(2)}%`;
+  }
+  return { label, value, upper: upper ?? value, text, note };
+}
+
+function MetricTabs({ metric, onChange }: { metric: Metric; onChange: (metric: Metric) => void }) {
+  return <div className="metric-tabs" role="group" aria-label="图表指标">{metricOrder.map((id) =>
+    <button key={id} aria-pressed={metric === id} onClick={() => onChange(id)}>{metrics[id].label}</button>)}</div>;
+}
+
+function ComparisonBars({ metric, items }: { metric: Metric; items: ChartItem[] }) {
+  const definition = metrics[metric];
+  const max = Math.max(0, ...items.map((entry) => entry.upper ?? 0));
+  const [first, second] = items;
+  const a = first.value;
+  const b = second.value;
+  let verdict = "";
+  if (a != null && b != null) {
+    if (a === b) verdict = "两者相同";
+    else {
+      const higher = a > b ? first.label : second.label;
+      const lower = Math.min(a, b);
+      verdict = lower === 0 ? `${higher}消耗更多` : `${higher}为另一方的 ${(Math.max(a, b) / lower).toFixed(2)} 倍`;
+    }
+  }
+  return <figure className="comparison-chart" aria-label={`${definition.title}对比柱状图`}>
+    <figcaption><strong>{definition.title}</strong><span>{definition.unit}</span></figcaption>
+    {items.map((entry, index) => <div className="chart-item" data-series={index === 0 ? "first" : "second"} key={entry.label}>
+      <div className="chart-value"><span>{entry.label}</span><strong>{entry.text}{entry.note && <small>{entry.note}</small>}</strong></div>
+      <div className={entry.value == null ? "chart-track is-missing" : "chart-track"} aria-hidden="true">
+        {entry.value != null && max > 0 && <>
+          <span className="chart-fill" style={{ width: `${entry.value / max * 100}%` }} />
+          {entry.upper != null && entry.upper > entry.value && <span className="chart-range" style={{ left: `${entry.value / max * 100}%`, width: `${(entry.upper - entry.value) / max * 100}%` }} />}
+        </>}
+      </div>
+    </div>)}
+    {verdict && <p className="chart-verdict">{verdict}</p>}
+  </figure>;
+}
+
+function DetailTable({ names, cycles }: { names: string[]; cycles: Array<CycleSummary | null | undefined> }) {
+  const rows: Array<{ label: string; value: (cycle: CycleSummary) => string }> = [
+    { label: "周期", value: range },
+    { label: "Token 总量", value: (cycle) => cycle.sampleCount ? count(cycle.tokenUsage.total) : "--" },
+    { label: "输入 / 输出", value: (cycle) => cycle.sampleCount ? `${count(cycle.tokenUsage.input)} / ${count(cycle.tokenUsage.output)}` : "--" },
+    { label: "缓存读取 / 写入", value: (cycle) => cycle.sampleCount ? `${count(cycle.tokenUsage.cachedInput)} / ${count(cycle.cacheWriteTokens)}` : "--" },
+    { label: "API 成本", value: cycleCost },
     { label: "每 1% 的 Token", value: (cycle) => count(cycle.tokensPerPercent) },
-    { label: "每 1% 的等价成本", value: (cycle) => cost(cycle.costPerPercentLow, cycle.costPerPercentHigh) },
-    { label: "额度回落记录", value: (cycle) => `${cycle.quotaDrops} 次` }
+    { label: "每 1% 的 API 成本", value: (cycle) => cost(cycle.costPerPercentLow, cycle.costPerPercentHigh) },
+    { label: "已观察额度消耗", value: (cycle) => cycle.observedFrom && cycle.observedFrom !== cycle.observedUntil ? `${cycle.observedPercent.toFixed(1)}%` : "采样不足" },
+    { label: "额度回落", value: (cycle) => `${cycle.quotaDrops} 次` },
+    { label: "模型", value: (cycle) => cycle.models.join("、") || "--" }
   ];
-  return <div className="token-section">
-    {snapshot && <div className="token-summary-grid">
-      <button className={expanded ? "token-block is-expanded" : "token-block"} onClick={onToggle} aria-expanded={expanded}>
-        <div className="token-title"><Database size={16} /><span>本周期 Token</span></div>
-        <div className="token-total">{count(cycleTokenCount)}</div>
-        <div className="token-metrics"><span><small>输入</small><strong>{cycleTokenCount == null ? "--" : count(current?.tokenUsage.input)}</strong></span><span><small>输出</small><strong>{cycleTokenCount == null ? "--" : count(current?.tokenUsage.output)}</strong></span></div>
-      </button>
-      <button className={expanded ? "api-summary-card is-expanded" : "api-summary-card"} onClick={onToggle} aria-expanded={expanded}>
-        <div className="api-summary-head"><span>API 等价成本</span>{expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</div>
-        <strong className={current?.unknownPriceModels.length ? "has-price-gap" : ""} title={cycleCost(current)}>{cycleCost(current)}</strong>
-        <small>{current?.unknownPriceModels.length ? `完整总额未知 · ${current.pricedSampleCount ?? 0}/${current.sampleCount} 条已定价` : `${selected?.label ?? "等待周期数据"} · 点击对比`}</small>
-      </button>
-    </div>}
-    {expanded && <section id="usage-comparison-panel" className="cycle-panel" aria-label="实际额度周期对比">
-      <div className="analytics-view-tabs" role="group" aria-label="对比方式">
-        <button aria-pressed={!crossProvider} onClick={() => onViewChange("cycle")}>本周期 / 上周期</button>
-        <button aria-pressed={crossProvider} onClick={() => onViewChange("providers")}>Codex / Claude 同周期</button>
-      </div>
-      {crossProvider ? <CrossProviderComparison /> : <>
-      <div className="api-period-tabs" role="group" aria-label="额度窗口">
-        {comparisons.map((item) => <button key={item.windowId} aria-pressed={item === selected} className={item === selected ? "is-active" : ""} onClick={() => setWindowId(item.windowId)}>{item.label}</button>)}
-      </div>
-      <div className="cycle-scroll">
-        <table><thead><tr><th>实际额度周期</th><th>本周期（进行中）</th><th>上周期</th></tr></thead>
-          <tbody><tr><th>起止时间</th><td>{range(current)}</td><td>{range(previous)}</td></tr>
-            {rows.map((row) => <tr key={row.label}><th>{row.label}</th><td>{current ? row.value(current) : "--"}</td><td>{previous ? row.value(previous) : "--"}</td></tr>)}
-            <tr><th>模型</th><td>{current?.models.join("、") || "--"}</td><td>{previous?.models.join("、") || "--"}</td></tr>
-          </tbody></table>
-        {current?.observedFrom && <p>本周期额度观察：{date.format(new Date(current.observedFrom))} — {date.format(new Date(current.observedUntil ?? current.observedFrom))}</p>}
-        {(current?.unknownPriceModels.length ?? 0) > 0 && <p className="price-gap">未定价模型：{current?.unknownPriceModels.join("、")}。完整总额未知；“部分”仅为已定价请求的小计，未定价请求仍计入 Token。</p>}
-        {(previous?.unknownPriceModels.length ?? 0) > 0 && <p className="price-gap">上周期未定价模型：{previous?.unknownPriceModels.join("、")}。</p>}
-        <p>Token 仅统计本机已记录的请求；未采集的历史不补零。Claude 从插件接入后记录，Codex 可读取现存会话日志。</p>
-        <p>按实际重置时间划分窗口。读数取整未增长时先累计请求，增长后再计入每 1%；尾部未反映的请求暂不计入。额度回落原因未确认，回落区间不参与该指标。</p>
-        <p>总量受周期进度影响，优先比较每 1% 的 Token 与成本，并核对模型及缓存比例。跨设备、网页用量和采样缺口都会影响结果，不能仅凭此认定平台减额。</p>
-        <p>按 2026-10-24 官方标准短上下文单价统一估算，不含工具等费用及速度、地域溢价。缓存写入未提供 TTL 时显示价格区间；这不是实际账单。</p>
-      </div>
-      </>}
-    </section>}
+  return <table><thead><tr><th>明细</th>{names.map((name) => <th key={name}>{name}</th>)}</tr></thead><tbody>
+    {rows.map((row) => <tr key={row.label}><th>{row.label}</th>{cycles.map((cycle, index) => <td key={index}>{cycle ? row.value(cycle) : "--"}</td>)}</tr>)}
+  </tbody></table>;
+}
+
+function CycleChart({ snapshot }: { snapshot: UsageSnapshot | null }) {
+  const [windowId, setWindowId] = useState<string | null>(null);
+  const [metric, setMetric] = useState<Metric>("tokens");
+  const comparisons = snapshot?.cycleComparisons ?? [];
+  const selected = comparisons.find((entry) => entry.windowId === windowId) ?? comparisons[comparisons.length - 1];
+  const cycles = [selected?.current, selected?.previous];
+  return <div className="analytics-body">
+    <div className="analytics-window-tabs" role="group" aria-label="额度窗口">{comparisons.map((entry) =>
+      <button key={entry.windowId} aria-pressed={entry === selected} onClick={() => setWindowId(entry.windowId)}>{entry.label}</button>)}</div>
+    <MetricTabs metric={metric} onChange={setMetric} />
+    <ComparisonBars metric={metric} items={[item("本周期·进行中", cycles[0], metric), item("上周期", cycles[1], metric)]} />
+    <details className="analytics-details"><summary>统计说明与明细</summary>
+      <DetailTable names={["本周期", "上周期"]} cycles={cycles} />
+      <p>进行中的本周期与完整上周期时长不同。单位耗额只使用已匹配到额度增长的请求。</p>
+      <p>API 成本按官方标准短上下文单价估算；“部分”不含未定价请求，浅色条表示缓存写入的估算区间，不是实际账单。</p>
+      {cycles.map((cycle, index) => cycle?.unknownPriceModels.length ? <p key={index}>未定价：{cycle.unknownPriceModels.join("、")}</p> : null)}
+    </details>
   </div>;
-}
-
-function metricState(period: ProviderPeriod) {
-  if (period.summary.sampleCount === 0) return "区间内无 Token 记录";
-  if (period.summary.quotaDrops > 0) return "额度有回落，暂停比较";
-  if (period.summary.observedPercent < 1) return "增长不足 1 个百分点";
-  return period.percentPerMillionTokens == null ? "Token 数据不足" : `${period.percentPerMillionTokens.toFixed(2)} 个百分点`;
-}
-
-function relative(left: number | null | undefined, right: number | null | undefined, metric: string) {
-  if (left == null || right == null || left <= 0 || right <= 0) return `${metric}：数据不足，暂不排名。`;
-  const difference = Math.abs(left - right) / Math.min(left, right);
-  if (difference < 0.01) return `${metric}：两者相近（差异不足 1%）。`;
-  return `${metric}：${left > right ? "Codex" : "Claude"} 为另一方的 ${(Math.max(left, right) / Math.min(left, right)).toFixed(2)} 倍。`;
 }
 
 function CrossProviderComparison() {
   const [data, setData] = useState<ProviderComparison | null>(null);
   const [error, setError] = useState("");
+  const [metric, setMetric] = useState<Metric>("quota");
   useEffect(() => {
     let active = true;
     let inFlight = false;
@@ -112,50 +201,29 @@ function CrossProviderComparison() {
       try {
         const result = await desktopApi.getUsageComparison();
         if (active) { setData(result); setError(""); }
-      } catch (error) {
-        if (active) { setData(null); setError(String(error)); }
-      } finally { inFlight = false; }
+      } catch (error) { if (active) { setData(null); setError(String(error)); } }
+      finally { inFlight = false; }
     }
     void load();
     const timer = window.setInterval(load, 30_000);
     return () => { active = false; window.clearInterval(timer); };
   }, []);
-  if (error) return <div className="comparison-state" role="status"><strong>暂不能对比</strong><p>{error}</p><p>保持两边采集在线，数据更新后自动重算。</p></div>;
-  if (!data) return <div className="comparison-state" role="status">正在对齐两边的周额度与请求记录…</div>;
+  if (error) return <div className="comparison-state" role="status"><strong>暂时无法对比</strong><p>{error}</p></div>;
+  if (!data) return <div className="comparison-state" role="status">正在对齐两边读数…</div>;
   const periods = [data.codex, data.claude];
-  const rows: Array<{ label: string; value: (period: ProviderPeriod) => string }> = [
-    { label: "套餐", value: (period) => period.planName },
-    { label: "Token 总量", value: ({ summary }) => summary.sampleCount ? count(summary.tokenUsage.total) : "区间内无记录" },
-    { label: "输入 / 输出", value: ({ summary }) => summary.sampleCount ? `${count(summary.tokenUsage.input)} / ${count(summary.tokenUsage.output)}` : "--" },
-    { label: "缓存读取占输入", value: ({ summary }) => summary.tokenUsage.input ? `${((summary.tokenUsage.cachedInput ?? 0) / summary.tokenUsage.input * 100).toFixed(1)}%` : "--" },
-    { label: "API 等价成本", value: ({ summary }) => cycleCost(summary) },
-    { label: "周额度增长", value: ({ summary }) => `${summary.observedPercent.toFixed(2)} 个百分点${summary.quotaDrops ? "（有回落）" : ""}` },
-    { label: "每百万 Token 耗周额度 ↓", value: metricState },
-    { label: "端点读数偏差", value: (period) => `≤ ${period.endpointSkewSeconds} 秒` },
-    { label: "最近 Token 记录", value: (period) => period.lastRecordedAt ? date.format(new Date(period.lastRecordedAt)) : "从未收到" },
-    { label: "模型", value: ({ summary }) => summary.models.join("、") || "--" }
-  ];
-  const gptTotal = data.codex.summary.sampleCount ? data.codex.summary.tokenUsage.total : null;
-  const claudeTotal = data.claude.summary.sampleCount ? data.claude.summary.tokenUsage.total : null;
-  const quotasComparable = periods.every((period) => period.summary.quotaDrops === 0 && period.summary.observedPercent >= 1);
-  return <div className="cycle-scroll">
-    <p className="comparison-range">共同时间：{range({ ...data.codex.summary, startAt: data.startAt, endAt: data.endAt })}</p>
-    {periods.map((period, index) => period.summary.sampleCount === 0 && <div key={index} className="token-gap" role="status">
-      <strong>{index === 0 ? "Codex" : "Claude"} 周额度有读数，当前区间没有 Token 记录</strong>
-      {period.lastRecordedAt ? <p>本机已有 {period.recordedSampleCount} 条请求记录，最近一次：{date.format(new Date(period.lastRecordedAt))}。{new Date(period.lastRecordedAt) <= new Date(data.startAt) ? "最近记录早于上面的共同起点，未计入本轮对比。" : "已有记录均不在上面的共同时间内。"}</p> : <p>本机尚未收到请求 Token 记录。</p>}
-      {index === 1 && <p>额度查询不会返回 Token 数；插件只记录已接入的 Code 请求。Projects / 普通聊天不经过这个插件，无法计入 Token。若正在使用 Code，请检查该会话是否加载了用量插件。</p>}
-    </div>)}
-    <div className="comparison-verdict" aria-label="用量对比结论">
-      <strong>本机观测估计</strong>
-      <p>{gptTotal == null || claudeTotal == null ? "Token 总量：当前区间缺少请求记录，无法判断谁更多。" : relative(gptTotal, claudeTotal, "Token 总量")}</p>
-      <p>{quotasComparable ? relative(data.codex.summary.observedPercent, data.claude.summary.observedPercent, "周额度消耗") : "周额度消耗：采样不足或额度回落，暂不排名。"}</p>
-      <p>{relative(data.codex.percentPerMillionTokens, data.claude.percentPerMillionTokens, "每百万 Token 耗额（越低越省）")}</p>
-    </div>
-    <table><thead><tr><th>同周期观测</th><th>Codex（GPT）</th><th>Claude</th></tr></thead><tbody>
-      {rows.map((row) => <tr key={row.label}><th>{row.label}</th>{periods.map((period, index) => <td key={index}>{row.value(period)}</td>)}</tr>)}
-    </tbody></table>
-    {periods.map((period, index) => period.summary.unknownPriceModels.length > 0 && <p key={index} className="price-gap">{index === 0 ? "Codex" : "Claude"} 未定价：{period.summary.unknownPriceModels.join("、")}；“部分”为已定价小计。</p>)}
-    <p>算法：取两边当前周额度的共同观测区间，Token 使用同一起止时间；周耗额累加区间内正向增长。每百万 Token 耗额 = 周额度增长 ÷ Token 总量 × 100 万。端点取此前最近读数，偏差超过 3 分钟不计算；增长不足 1 个百分点或存在回落不排名。</p>
-    <p>这是观测估计：周额度覆盖账号各入口，Token 仅覆盖本机已采集请求。Claude 网页 / Projects、跨设备用量和漏采会使耗额比偏高；缓存比例、模型及两家分词器也不同，不能据此认定同等任务更省或平台减额。</p>
+  return <div className="analytics-body">
+    <p className="comparison-period">{range({ ...data.codex.summary, startAt: data.startAt, endAt: data.endAt })}</p>
+    <MetricTabs metric={metric} onChange={setMetric} />
+    <ComparisonBars metric={metric} items={[
+      item("Codex", data.codex.summary, metric, data.codex.percentPerMillionTokens),
+      item("Claude", data.claude.summary, metric, data.claude.percentPerMillionTokens)
+    ]} />
+    {data.claude.summary.sampleCount === 0 && <p className="analytics-status">Claude Token：Projects / 普通聊天不提供采集数据</p>}
+    <details className="analytics-details"><summary>统计说明与明细</summary>
+      <DetailTable names={["Codex", "Claude"]} cycles={periods.map((period) => period.summary)} />
+      {periods.map((period, index) => <p key={index}>{index === 0 ? "Codex" : "Claude"}：{period.planName}；历史请求 {period.recordedSampleCount} 条；最近记录 {period.lastRecordedAt ? date.format(new Date(period.lastRecordedAt)) : "暂无"}；端点偏差 ≤ {period.endpointSkewSeconds} 秒。</p>)}
+      <p>只比较两边具有配对额度读数的共同区间，端点偏差不超过 3 分钟。Token 为同一时间段的本机记录，周额度包含账号各入口；不同模型、缓存和分词器会影响结果。</p>
+      <p>每百万 Token 耗额 = 周额度增长 ÷ Token × 100 万。增长不足 1 个百分点、额度回落或 Token 缺失时不计算。Projects / 普通聊天不经过 Code 插件，不能用额度百分比反推 Token。</p>
+    </details>
   </div>;
 }

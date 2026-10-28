@@ -2380,11 +2380,15 @@ fn set_expanded(app: AppHandle, expanded: bool, extra_height: Option<u32>) -> Re
         return Ok(());
     };
     let scale_factor = window.scale_factor().unwrap_or(1.0);
-    let target_height = if expanded {
+    let mut target_height = if expanded {
         (COLLAPSED_HEIGHT + extra_height.unwrap_or(0) as f64).min(MAX_EXPANDED_HEIGHT)
     } else {
         COLLAPSED_HEIGHT
     };
+    if let Some(monitor) = target_monitor(&app) {
+        let available_height = monitor.work_area().size.height as f64 / scale_factor - DOCK_EDGE_GAP * 2.0;
+        target_height = target_height.min(available_height.max(COLLAPSED_HEIGHT));
+    }
     let size = if expanded {
         tauri::LogicalSize::new(COLLAPSED_WIDTH, target_height)
     } else {

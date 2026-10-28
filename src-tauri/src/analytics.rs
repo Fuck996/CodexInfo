@@ -228,14 +228,46 @@ pub(super) fn compare_providers(
 ) -> Result<ProviderComparison, String> {
     let gpt = weekly_readings(history, codex, "codex")?;
     let cl = weekly_readings(history, claude, "claude")?;
-    let start = gpt.points[0].at.max(cl.points[0].at);
-    let end = gpt.points.last().expect("two readings").at.min(cl.points.last().expect("two readings").at);
-    if end <= start { return Err("两边本周额度尚无共同观测区间，等待后续采样".into()); }
+    let (start, end) = common_bounds(&gpt, &cl)?;
     Ok(ProviderComparison {
         start_at: start.to_rfc3339(), end_at: end.to_rfc3339(),
         codex: compare_period(&gpt, start, end, codex_samples, "codex", &codex.plan_name)?,
         claude: compare_period(&cl, start, end, claude_samples, "claude", &claude.plan_name)?,
     })
+}
+
+fn common_bounds(left: &WeeklyReadings<'_>, right: &WeeklyReadings<'_>) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    let (mut i, mut j) = (0, 0);
+    let (mut latest_left, mut latest_right) = (None, None);
+    let mut first = None;
+    let mut end = None;
+    while i < left.points.len() || j < right.points.len() {
+        let at = match (left.points.get(i), right.points.get(j)) {
+            (Some(a), Some(b)) => a.at.min(b.at),
+            (Some(a), None) => a.at,
+            (None, Some(b)) => b.at,
+            (None, None) => unreachable!(),
+        };
+        while left.points.get(i).is_some_and(|point| point.at <= at) {
+            latest_left = Some(left.points[i].at);
+            i += 1;
+        }
+        while right.points.get(j).is_some_and(|point| point.at <= at) {
+            latest_right = Some(right.points[j].at);
+            j += 1;
+        }
+        let (Some(a), Some(b)) = (latest_left, latest_right) else { continue };
+        if at - a > Duration::minutes(3) || at - b > Duration::minutes(3) { continue; }
+        match first {
+            None => first = Some((at, a, b)),
+            Some((_, first_a, first_b)) if a > first_a && b > first_b => end = Some(at),
+            _ => {},
+        }
+    }
+    match (first, end) {
+        (Some((start, _, _)), Some(end)) => Ok((start, end)),
+        _ => Err("尚无两组可对齐的周额度读数，等待共同采样".into()),
+    }
 }
 
 fn compare_period(
@@ -535,17 +567,17 @@ mod tests {
         let records = [sample("2026-10-24T00:00:30Z"), sample("2026-10-24T01:00:00Z"), sample("2026-10-24T02:00:30Z")];
         let result = compare_providers(&history, &codex, &claude, &records, &records).unwrap();
         assert_eq!(at(&result.start_at), at("2026-10-24T00:01:00Z"));
-        assert_eq!(at(&result.end_at), at("2026-10-24T02:00:00Z"));
-        assert_eq!(result.codex.summary.sample_count, 1);
-        assert_eq!(result.claude.summary.sample_count, 1);
+        assert_eq!(at(&result.end_at), at("2026-10-24T02:01:00Z"));
+        assert_eq!(result.codex.summary.sample_count, 2);
+        assert_eq!(result.claude.summary.sample_count, 2);
         assert!((result.codex.summary.observed_percent - 4.0).abs() < 1e-9);
-        assert!((result.claude.summary.observed_percent - 1.0).abs() < 1e-9);
+        assert!((result.claude.summary.observed_percent - 2.0).abs() < 1e-9);
         assert_eq!(result.codex.endpoint_skew_seconds, 60);
-        assert_eq!(result.claude.endpoint_skew_seconds, 60);
+        assert_eq!(result.claude.endpoint_skew_seconds, 0);
     }
 
     #[test]
-    fn cross_provider_rejects_missing_endpoint_readings() {
+    fn cross_provider_pairs_latest_readings_after_a_polling_gap() {
         let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
             ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T02:00:00Z", 12.0)]);
         let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
@@ -553,7 +585,47 @@ mod tests {
         let mut history = History::default();
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
-        assert!(compare_providers(&history, &codex, &claude, &[], &[]).err().unwrap().contains("端点"));
+        let result = compare_providers(&history, &codex, &claude, &[], &[]).unwrap();
+        assert_eq!(at(&result.end_at), at("2026-10-24T02:01:00Z"));
+        assert_eq!(result.claude.endpoint_skew_seconds, 0);
+        assert_eq!(result.codex.endpoint_skew_seconds, 60);
+    }
+
+    #[test]
+    fn cross_provider_skips_an_unpaired_prefix_and_handles_alternating_polls() {
+        let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+            ("2026-10-24T00:00:00Z", 1.0), ("2026-10-24T02:00:00Z", 10.0),
+            ("2026-10-24T02:02:00Z", 11.0), ("2026-10-24T02:04:00Z", 12.0)]);
+        let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
+            ("2026-10-24T01:00:00Z", 1.0), ("2026-10-24T02:01:00Z", 10.0),
+            ("2026-10-24T02:03:00Z", 11.0), ("2026-10-24T02:05:00Z", 12.0)]);
+        let mut history = History::default();
+        history.observations.insert("codex".into(), gpt_points);
+        history.observations.insert("claude".into(), cl_points);
+        for (provider, time) in [("codex", "2026-10-24T02:06:00Z"), ("claude", "2026-10-24T02:07:00Z")] {
+            let result = compare_providers(&history, &codex, &claude, &[], &[]).unwrap();
+            assert_eq!(at(&result.start_at), at("2026-10-24T02:01:00Z"));
+            assert!(result.codex.endpoint_skew_seconds <= 180);
+            assert!(result.claude.endpoint_skew_seconds <= 180);
+            let observations = history.observations.get_mut(provider).unwrap();
+            let mut next = observations.last().unwrap().clone();
+            next.at = at(time);
+            observations.push(next);
+        }
+        let result = compare_providers(&history, &codex, &claude, &[], &[]).unwrap();
+        assert_eq!(at(&result.end_at), at("2026-10-24T02:07:00Z"));
+    }
+
+    #[test]
+    fn cross_provider_does_not_relax_alignment_for_unpaired_histories() {
+        let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+            ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T00:01:00Z", 12.0)]);
+        let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
+            ("2026-10-24T02:00:00Z", 20.0), ("2026-10-24T02:01:00Z", 21.0)]);
+        let mut history = History::default();
+        history.observations.insert("codex".into(), gpt_points);
+        history.observations.insert("claude".into(), cl_points);
+        assert!(compare_providers(&history, &codex, &claude, &[], &[]).err().unwrap().contains("共同采样"));
     }
 
     #[test]
