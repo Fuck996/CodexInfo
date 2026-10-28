@@ -81,6 +81,8 @@ export type CycleComparison = {
 
 export type ProviderPeriod = {
   planName: string;
+  recordedSampleCount: number;
+  lastRecordedAt: string | null;
   summary: CycleSummary;
   quotaFrom: string;
   quotaUntil: string;

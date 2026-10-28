@@ -190,6 +190,8 @@ pub(super) struct ProviderComparison {
 #[serde(rename_all = "camelCase")]
 struct ProviderPeriod {
     plan_name: String,
+    recorded_sample_count: usize,
+    last_recorded_at: Option<String>,
     summary: CycleSummary,
     quota_from: String,
     quota_until: String,
@@ -251,8 +253,9 @@ fn compare_period(
         DateTime::parse_from_rfc3339(&sample.timestamp)
             .map(|at| (at.with_timezone(&Utc), sample)).map_err(|error| error.to_string())
     }).collect::<Result<Vec<_>, _>>()?;
-    timed.retain(|(at, _)| *at > start && *at <= end);
     timed.sort_by_key(|(at, _)| *at);
+    let last_recorded_at = timed.last().map(|(at, _)| at.to_rfc3339());
+    timed.retain(|(at, _)| *at > start && *at <= end);
     let mut summary = summarize(readings.reset - Duration::days(7), readings.reset, 10_080, &points, &timed, provider);
     summary.start_at = start.to_rfc3339();
     summary.end_at = end.to_rfc3339();
@@ -260,7 +263,8 @@ fn compare_period(
     let percent_per_million_tokens = summary.token_usage.total.filter(|total| *total > 0.0)
         .filter(|_| summary.observed_percent >= 1.0 && summary.quota_drops == 0)
         .map(|total| summary.observed_percent / total * 1_000_000.0);
-    Ok(ProviderPeriod { plan_name: plan.into(), summary, quota_from: from.to_rfc3339(),
+    Ok(ProviderPeriod { plan_name: plan.into(), recorded_sample_count: samples.len(), last_recorded_at,
+        summary, quota_from: from.to_rfc3339(),
         quota_until: until.to_rfc3339(), endpoint_skew_seconds: skew, percent_per_million_tokens })
 }
 
@@ -566,6 +570,24 @@ mod tests {
         let empty = compare_period(&readings, readings.points[1].at, readings.points[2].at, &[], "codex", "Pro").unwrap();
         assert_eq!(empty.summary.sample_count, 0);
         assert_eq!(empty.percent_per_million_tokens, None);
+    }
+
+    #[test]
+    fn empty_comparison_exposes_existing_records_outside_the_current_period() {
+        let (snapshot, points) = comparison_fixture("claude", "2026-10-30T00:00:00Z", &[
+            ("2026-10-24T02:00:00Z", 10.0), ("2026-10-24T03:00:00Z", 12.0)]);
+        let mut history = History::default();
+        history.observations.insert("claude".into(), points);
+        let readings = weekly_readings(&history, &snapshot, "claude").unwrap();
+        let records = [sample("2026-10-24T01:00:00Z")];
+        let result = compare_period(&readings, readings.points[0].at, readings.points[1].at, &records, "claude", "Claude Pro").unwrap();
+        assert_eq!(result.recorded_sample_count, 1);
+        assert_eq!(at(result.last_recorded_at.as_deref().unwrap()), at(&records[0].timestamp));
+        assert_eq!(result.summary.sample_count, 0);
+        assert_eq!(result.percent_per_million_tokens, None);
+        let empty = compare_period(&readings, readings.points[0].at, readings.points[1].at, &[], "claude", "Claude Pro").unwrap();
+        assert_eq!(empty.recorded_sample_count, 0);
+        assert_eq!(empty.last_recorded_at, None);
     }
 
     #[test]

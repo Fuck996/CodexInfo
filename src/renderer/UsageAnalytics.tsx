@@ -20,10 +20,16 @@ function range(cycle: CycleSummary | null | undefined) {
   return cycle ? `${date.format(new Date(cycle.startAt))} — ${date.format(new Date(cycle.endAt))}` : "尚无历史窗口";
 }
 
-export function UsageAnalytics({ snapshot, expanded, onToggle }: { snapshot: UsageSnapshot; expanded: boolean; onToggle: () => void }) {
+export function UsageAnalytics({ snapshot, view, onViewChange, onToggle }: {
+  snapshot: UsageSnapshot | null;
+  view: "cycle" | "providers" | null;
+  onViewChange: (view: "cycle" | "providers") => void;
+  onToggle: () => void;
+}) {
   const [windowId, setWindowId] = useState<string | null>(null);
-  const [crossProvider, setCrossProvider] = useState(false);
-  const comparisons = snapshot.cycleComparisons ?? [];
+  const expanded = view !== null;
+  const crossProvider = view === "providers";
+  const comparisons = snapshot?.cycleComparisons ?? [];
   const selected = comparisons.find((item) => item.windowId === windowId) ?? comparisons[comparisons.length - 1];
   const current = selected?.current;
   const previous = selected?.previous;
@@ -40,7 +46,7 @@ export function UsageAnalytics({ snapshot, expanded, onToggle }: { snapshot: Usa
     { label: "额度回落记录", value: (cycle) => `${cycle.quotaDrops} 次` }
   ];
   return <div className="token-section">
-    <div className="token-summary-grid">
+    {snapshot && <div className="token-summary-grid">
       <button className={expanded ? "token-block is-expanded" : "token-block"} onClick={onToggle} aria-expanded={expanded}>
         <div className="token-title"><Database size={16} /><span>本周期 Token</span></div>
         <div className="token-total">{count(cycleTokenCount)}</div>
@@ -51,11 +57,11 @@ export function UsageAnalytics({ snapshot, expanded, onToggle }: { snapshot: Usa
         <strong className={current?.unknownPriceModels.length ? "has-price-gap" : ""} title={cycleCost(current)}>{cycleCost(current)}</strong>
         <small>{current?.unknownPriceModels.length ? `完整总额未知 · ${current.pricedSampleCount ?? 0}/${current.sampleCount} 条已定价` : `${selected?.label ?? "等待周期数据"} · 点击对比`}</small>
       </button>
-    </div>
-    {expanded && <section className="cycle-panel" aria-label="实际额度周期对比">
+    </div>}
+    {expanded && <section id="usage-comparison-panel" className="cycle-panel" aria-label="实际额度周期对比">
       <div className="analytics-view-tabs" role="group" aria-label="对比方式">
-        <button aria-pressed={!crossProvider} onClick={() => setCrossProvider(false)}>本周期 / 上周期</button>
-        <button aria-pressed={crossProvider} onClick={() => setCrossProvider(true)}>Codex / Claude 同周期</button>
+        <button aria-pressed={!crossProvider} onClick={() => onViewChange("cycle")}>本周期 / 上周期</button>
+        <button aria-pressed={crossProvider} onClick={() => onViewChange("providers")}>Codex / Claude 同周期</button>
       </div>
       {crossProvider ? <CrossProviderComparison /> : <>
       <div className="api-period-tabs" role="group" aria-label="额度窗口">
@@ -81,7 +87,7 @@ export function UsageAnalytics({ snapshot, expanded, onToggle }: { snapshot: Usa
 }
 
 function metricState(period: ProviderPeriod) {
-  if (period.summary.sampleCount === 0) return "未采集请求";
+  if (period.summary.sampleCount === 0) return "区间内无 Token 记录";
   if (period.summary.quotaDrops > 0) return "额度有回落，暂停比较";
   if (period.summary.observedPercent < 1) return "增长不足 1 个百分点";
   return period.percentPerMillionTokens == null ? "Token 数据不足" : `${period.percentPerMillionTokens.toFixed(2)} 个百分点`;
@@ -119,13 +125,14 @@ function CrossProviderComparison() {
   const periods = [data.codex, data.claude];
   const rows: Array<{ label: string; value: (period: ProviderPeriod) => string }> = [
     { label: "套餐", value: (period) => period.planName },
-    { label: "Token 总量", value: ({ summary }) => summary.sampleCount ? count(summary.tokenUsage.total) : "未采集" },
+    { label: "Token 总量", value: ({ summary }) => summary.sampleCount ? count(summary.tokenUsage.total) : "区间内无记录" },
     { label: "输入 / 输出", value: ({ summary }) => summary.sampleCount ? `${count(summary.tokenUsage.input)} / ${count(summary.tokenUsage.output)}` : "--" },
     { label: "缓存读取占输入", value: ({ summary }) => summary.tokenUsage.input ? `${((summary.tokenUsage.cachedInput ?? 0) / summary.tokenUsage.input * 100).toFixed(1)}%` : "--" },
     { label: "API 等价成本", value: ({ summary }) => cycleCost(summary) },
     { label: "周额度增长", value: ({ summary }) => `${summary.observedPercent.toFixed(2)} 个百分点${summary.quotaDrops ? "（有回落）" : ""}` },
     { label: "每百万 Token 耗周额度 ↓", value: metricState },
     { label: "端点读数偏差", value: (period) => `≤ ${period.endpointSkewSeconds} 秒` },
+    { label: "最近 Token 记录", value: (period) => period.lastRecordedAt ? date.format(new Date(period.lastRecordedAt)) : "从未收到" },
     { label: "模型", value: ({ summary }) => summary.models.join("、") || "--" }
   ];
   const gptTotal = data.codex.summary.sampleCount ? data.codex.summary.tokenUsage.total : null;
@@ -133,9 +140,14 @@ function CrossProviderComparison() {
   const quotasComparable = periods.every((period) => period.summary.quotaDrops === 0 && period.summary.observedPercent >= 1);
   return <div className="cycle-scroll">
     <p className="comparison-range">共同时间：{range({ ...data.codex.summary, startAt: data.startAt, endAt: data.endAt })}</p>
+    {periods.map((period, index) => period.summary.sampleCount === 0 && <div key={index} className="token-gap" role="status">
+      <strong>{index === 0 ? "Codex" : "Claude"} 周额度有读数，当前区间没有 Token 记录</strong>
+      {period.lastRecordedAt ? <p>本机已有 {period.recordedSampleCount} 条请求记录，最近一次：{date.format(new Date(period.lastRecordedAt))}。{new Date(period.lastRecordedAt) <= new Date(data.startAt) ? "最近记录早于上面的共同起点，未计入本轮对比。" : "已有记录均不在上面的共同时间内。"}</p> : <p>本机尚未收到请求 Token 记录。</p>}
+      {index === 1 && <p>额度查询不会返回 Token 数；插件只记录已接入的 Code 请求。Projects / 普通聊天不经过这个插件，无法计入 Token。若正在使用 Code，请检查该会话是否加载了用量插件。</p>}
+    </div>)}
     <div className="comparison-verdict" aria-label="用量对比结论">
       <strong>本机观测估计</strong>
-      <p>{relative(gptTotal, claudeTotal, "Token 总量")}</p>
+      <p>{gptTotal == null || claudeTotal == null ? "Token 总量：当前区间缺少请求记录，无法判断谁更多。" : relative(gptTotal, claudeTotal, "Token 总量")}</p>
       <p>{quotasComparable ? relative(data.codex.summary.observedPercent, data.claude.summary.observedPercent, "周额度消耗") : "周额度消耗：采样不足或额度回落，暂不排名。"}</p>
       <p>{relative(data.codex.percentPerMillionTokens, data.claude.percentPerMillionTokens, "每百万 Token 耗额（越低越省）")}</p>
     </div>

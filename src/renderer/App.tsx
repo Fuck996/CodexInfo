@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { ArrowLeftRight, ChevronDown, ChevronUp } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useState } from "react";
@@ -203,7 +203,8 @@ export function App() {
   const [switching, setSwitching] = useState(false);
   const [snapshot, setSnapshot] = useState<UsageSnapshot | null>(null);
   const [expanded, setExpanded] = useState(false);
-  const [tokenExpanded, setTokenExpanded] = useState(false);
+  const [analyticsView, setAnalyticsView] = useState<"cycle" | "providers" | null>(null);
+  const tokenExpanded = analyticsView !== null;
   const [loading, setLoading] = useState(true);
   const [codexConnected, setCodexConnected] = useState(false);
   const [error, setError] = useState("");
@@ -356,7 +357,7 @@ export function App() {
   }
 
   function toggleTokenExpanded() {
-    setTokenExpanded((previous) => !previous);
+    setAnalyticsView((previous) => previous === "cycle" ? null : "cycle");
   }
 
   return (
@@ -385,7 +386,11 @@ export function App() {
               <button key={mode} aria-pressed={settings?.usageMode === mode} disabled={!settings || switching} onClick={() => void changeMode(mode)}>{label}</button>
             ))}
           </div>
-          <button className="settings-button" title="显示设置：屏幕、轮播间隔、Claude 接入" aria-label="显示设置" disabled={!settings} onClick={() => setSettingsOpen(true)}><Settings2 size={16} /></button>
+          <div className="source-actions">
+            <button className="comparison-button" aria-label="Codex 与 Claude 同周期对比" aria-expanded={analyticsView === "providers"} aria-controls="usage-comparison-panel"
+              onClick={() => setAnalyticsView((previous) => previous === "providers" ? null : "providers")}><ArrowLeftRight size={14} />同周期对比</button>
+            <button className="settings-button" title="显示设置：屏幕、轮播间隔、Claude 接入" aria-label="显示设置" disabled={!settings} onClick={() => setSettingsOpen(true)}><Settings2 size={16} /></button>
+          </div>
         </div>
         {error && snapshot && <div className="data-warning" role="alert">更新失败，显示上次数据：{error}</div>}
 
@@ -397,7 +402,7 @@ export function App() {
               ))}
             </div>
 
-            <UsageAnalytics expanded={tokenExpanded} onToggle={toggleTokenExpanded} snapshot={snapshot} />
+            <UsageAnalytics view={analyticsView} onViewChange={setAnalyticsView} onToggle={toggleTokenExpanded} snapshot={snapshot} />
             {snapshot.planError && <div className="data-warning" role="status">套餐：{snapshot.planError}</div>}
 
             {provider === "claude" ? (
@@ -420,7 +425,10 @@ export function App() {
             )}
           </>
         ) : (
-          <div className="error-panel">{error || "正在读取数据"}</div>
+          <>
+            <div className="error-panel">{error || "正在读取数据"}</div>
+            <UsageAnalytics view={analyticsView} onViewChange={setAnalyticsView} onToggle={toggleTokenExpanded} snapshot={null} />
+          </>
         )}
 
         {loading && <div className="loading-sheen" />}
