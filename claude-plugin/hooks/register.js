@@ -21,10 +21,12 @@ async function synchronize($, state) {
     try { body = JSON.parse(response.text); }
     catch { throw new Error("Claude 账号用量响应不是有效 JSON"); }
     const rateLimits = quotaWindows(body);
+    if (state.stopped) return;
+    const plan = await subscriptionPlan($, authorization);
     if (!state.stopped) await exportReading($, {
       type: "reading", source: "account",
       sessionId: await fileIdentifier(await $.session.id()),
-      updatedAt: new Date().toISOString(), rateLimits
+      updatedAt: new Date().toISOString(), rateLimits, ...plan
     });
   } catch (error) {
     if (!claimed || state.stopped) throw error;
@@ -34,6 +36,30 @@ async function synchronize($, state) {
       retryAfterSecs: error instanceof QuotaReadError ? error.retryAfterSecs : 120
     });
   } finally { state.inFlight = false; }
+}
+
+async function subscriptionPlan($, authorization) {
+  try {
+    const response = await $.http.fetch("https://api.anthropic.com/api/oauth/profile", {
+      auth: authorization.handle,
+      headers: { "Cache-Control": "no-cache" }
+    });
+    if (!response.ok) throw new Error(`Claude 套餐查询失败（HTTP ${response.status}）`);
+    const profile = JSON.parse(response.text);
+    const organization = profile?.organization;
+    // 与 Claude Code 2.1.309 的 profile 显示名校验及组织类型映射保持一致。
+    const display = organization?.plan_display_name;
+    if (display != null) {
+      if (typeof display !== "string" || !/^[\p{L}\p{N}](?:[\p{L}\p{N} .+-]{0,38}[\p{L}\p{N}+])?$/u.test(display)) throw new Error("Claude 套餐显示名无效");
+      return { planName: display.startsWith("Claude") ? display : `Claude ${display}`, planError: null };
+    }
+    const names = new Map([["claude_pro", "Claude Pro"], ["claude_max", "Claude Max"], ["claude_team", "Claude Team"], ["claude_enterprise", "Claude Enterprise"]]);
+    const name = names.get(organization?.organization_type);
+    if (!name) throw new Error("Claude 账号未提供可识别的套餐类型");
+    return { planName: name, planError: null };
+  } catch (error) {
+    return { planName: null, planError: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function tick($, state) {

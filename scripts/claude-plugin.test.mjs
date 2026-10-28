@@ -24,6 +24,9 @@ function harness() {
     ui: { log: (message) => logs.push(message) },
     http: { fetch: async (url, init) => {
       requests.push({ url, init });
+      if (url.endsWith("/profile")) return { ok: true, status: 200, text: JSON.stringify({
+        account: { email: "private@example.com" }, organization: { organization_type: "claude_pro" }
+      }) };
       return { ok: true, status: 200, headers: {}, text: JSON.stringify({
         five_hour: { utilization: 42.5, resets_at: "2027-01-01T05:00:00Z" },
         seven_day: { utilization: 7, resets_at: "2027-01-07T00:00:00Z" }
@@ -49,13 +52,48 @@ test("idle bridge polls account usage without a model turn or exporting authoriz
   await waitForExport(h.exports, 1);
   assert.equal(h.requests[0].url, "https://api.anthropic.com/api/oauth/usage");
   assert.equal(h.requests[0].init.auth, "opaque-handle");
+  assert.equal(h.requests[1].url, "https://api.anthropic.com/api/oauth/profile");
+  assert.equal(h.requests[1].init.auth, h.requests[0].init.auth);
   assert.equal(h.exports[0].reading.source, "account");
+  assert.equal(h.exports[0].reading.planName, "Claude Pro");
   assert.equal(h.exports[0].reading.rateLimits[0].percentUsed, 42.5);
   assert.match(h.exports[0].reading.sessionId, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(h.exports).includes("opaque-handle"), false);
+  assert.equal(JSON.stringify(h.exports).includes("private@example.com"), false);
   assert.equal(h.handlers.has("session.measure"), false);
   await h.tick();
   await waitForExport(h.exports, 2);
+});
+
+test("plan metadata failures are visible and do not discard account quotas", async () => {
+  const h = harness();
+  const fetch = h.api.http.fetch;
+  h.api.http.fetch = async (url, init) => url.endsWith("/profile")
+    ? { ok: false, status: 403 }
+    : fetch(url, init);
+  await h.start();
+  await waitForExport(h.exports, 1);
+  assert.equal(h.exports[0].reading.planName, null);
+  assert.match(h.exports[0].reading.planError, /HTTP 403/);
+  assert.equal(h.exports[0].reading.rateLimits[1].percentUsed, 7);
+});
+
+test("profile display names follow vendor validation and unknown plans stay explicit", async () => {
+  for (const [organization, expected, failure] of [
+    [{ plan_display_name: "Max 20x", organization_type: "claude_max" }, "Claude Max 20x", null],
+    [{ plan_display_name: "<invalid>", organization_type: "claude_pro" }, null, /显示名无效/],
+    [{ organization_type: "constructor" }, null, /未提供可识别/]
+  ]) {
+    const h = harness();
+    const fetch = h.api.http.fetch;
+    h.api.http.fetch = async (url, init) => url.endsWith("/profile")
+      ? { ok: true, text: JSON.stringify({ organization }) }
+      : fetch(url, init);
+    await h.start();
+    await waitForExport(h.exports, 1);
+    assert.equal(h.exports[0].reading.planName, expected);
+    if (failure) assert.match(h.exports[0].reading.planError, failure);
+  }
 });
 
 test("another session's claim prevents duplicate account requests", async () => {
@@ -108,7 +146,7 @@ test("clearing or resuming a conversation keeps the loaded bridge polling", asyn
   await h.handlers.get("session.end")(h.api, { reason: "clear" }, async () => ({}));
   await h.tick();
   assert.equal(h.cancelled(), false);
-  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests.length, 4);
 });
 
 test("request observer preserves the original stream and exports usage once", async () => {

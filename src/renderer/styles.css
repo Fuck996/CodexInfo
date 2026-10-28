@@ -258,6 +258,13 @@ button:disabled, select:disabled { opacity: .55; cursor: wait; }
 .cycle-panel thead th { color: var(--accent); }
 .cycle-panel p { color: var(--muted); line-height: 1.6; }
 .cycle-panel .price-gap { color: var(--yellow); }
+.analytics-view-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 6px; border-bottom: 1px solid var(--line-quiet); }
+.analytics-view-tabs button { min-height: 30px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--muted-strong); font: inherit; cursor: pointer; }
+.analytics-view-tabs button[aria-pressed="true"] { border-color: var(--line); color: var(--text); background: rgba(var(--accent-rgb), 0.16); }
+.analytics-view-tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.comparison-state { padding: 14px; color: var(--muted-strong); line-height: 1.6; }
+.comparison-verdict { padding: 4px 8px; margin-top: 10px; border-left: 2px solid var(--accent); background: rgba(var(--accent-rgb), 0.08); }
+.cycle-panel .comparison-range { color: var(--muted-strong); }
 
 .chrome {
   display: flex;
@@ -616,6 +623,8 @@ button:disabled, select:disabled { opacity: .55; cursor: wait; }
   color: var(--muted);
   font-size: 11px;
 }
+
+.api-summary-card strong.has-price-gap { font-size: 17px; line-height: 1.25; white-space: normal; overflow-wrap: anywhere; }
 
 .api-cost-panel {
   display: grid;

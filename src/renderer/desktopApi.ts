@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings, DesktopApi, MonitorOption, UsageSnapshot } from "../shared/types";
+import type { AppSettings, DesktopApi, MonitorOption, ProviderComparison, UsageSnapshot } from "../shared/types";
 
 declare global {
   interface Window {
@@ -10,6 +10,7 @@ declare global {
 const tauriApi: DesktopApi = {
   reportFrontendError: (source, message) => invoke<void>("report_frontend_error", { source, message }),
   getUsageSnapshot: (provider) => invoke<UsageSnapshot>("get_usage_snapshot", { provider }),
+  getUsageComparison: () => invoke<ProviderComparison>("get_usage_comparison"),
   getCachedUsageSnapshot: (provider) => invoke<UsageSnapshot | null>("get_cached_usage_snapshot", { provider }),
   setUsageMode: (mode, intervalSecs) => invoke<AppSettings>("set_usage_mode", { mode, intervalSecs }),
   getMonitors: () => invoke<MonitorOption[]>("get_monitors"),
@@ -32,6 +33,7 @@ const unavailableApi: DesktopApi = {
     throw new Error("Tauri 桥接不可用，请使用 npm run tauri:dev 或打包后的程序启动。");
   },
   getCachedUsageSnapshot: async () => null,
+  getUsageComparison: async () => { throw new Error("Tauri 桥接不可用"); },
   setUsageMode: async () => { throw new Error("Tauri 桥接不可用"); },
   getMonitors: async () => [],
   setSelectedMonitor: async () => { throw new Error("Tauri 桥接不可用"); },

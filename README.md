@@ -70,6 +70,10 @@ CodexInfo 优先读取本机 Codex 的真实数据：
 
 定价来源：[OpenAI](https://developers.openai.com/api/docs/pricing)、[Claude](https://platform.claude.com/docs/en/about-claude/pricing)。
 
+弹窗的「Codex / Claude 同周期」取两边当前周额度观测区间的交集，以完全相同的起止时间统计请求 Token，比较周额度增长及「每百万 Token 消耗的周额度百分点」，数值越低表示本段观测中单位 Token 耗额越少。端点采用此前最近的额度读数，偏差须在 3 分钟内并显示；不足 1 个百分点、存在额度回落或没有请求记录时不排名。周窗口不按自然周对齐，也不混入另一轮重置。结果是本机观测估计：账号额度包含网页 / Projects 和跨设备消耗，本机 Token 采集不覆盖这些入口；不同模型、缓存比例、分词器和漏采均影响结果，不能当作同等任务效率或套餐总容量的证明。
+
+未知单价（例如 `codex-auto-review`）不会套用其它模型价格。完整成本仍为未知，同时单独展示已定价请求的小计并标记「部分」和请求覆盖数；所有请求仍计入 Token。价格表补充了 `gpt-6.1-terra` 的官方标准短上下文单价。Claude 套餐复用额度桥接的同一个不透明授权句柄，请求 Claude Code 自身使用的 `/api/oauth/profile`，按 2.1.309 的 `organization.plan_display_name` / `organization_type` 显示逻辑读取套餐，不另启终端 CLI 推断桌面账号。只导出套餐名称，账号信息和令牌不导出；缺失或失败时明确显示原因，不影响账号额度。该接口与额度接口一样属于内置链路，没有稳定公开契约。更新后需在显示设置中重新接入桥接并在 Code 会话执行 `/reload-plugins`。
+
 ## 开发
 
 ```powershell

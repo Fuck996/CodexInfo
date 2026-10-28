@@ -36,6 +36,7 @@ export type UsageSnapshot = {
   cycleComparisons?: CycleComparison[];
   provider: UsageProvider;
   planName: string;
+  planError?: string | null;
   subscriptionExpiresAt: string;
   windows: UsageWindow[];
   tokenUsage: TokenUsage;
@@ -50,6 +51,9 @@ export type UsageSnapshot = {
 };
 
 export type CycleSummary = {
+  pricedSampleCount?: number;
+  pricedCostLowUsd?: number | null;
+  pricedCostHighUsd?: number | null;
   cacheWriteTokens: number;
   startAt: string;
   endAt: string;
@@ -75,6 +79,22 @@ export type CycleComparison = {
   previous: CycleSummary | null;
 };
 
+export type ProviderPeriod = {
+  planName: string;
+  summary: CycleSummary;
+  quotaFrom: string;
+  quotaUntil: string;
+  endpointSkewSeconds: number;
+  percentPerMillionTokens: number | null;
+};
+
+export type ProviderComparison = {
+  startAt: string;
+  endAt: string;
+  codex: ProviderPeriod;
+  claude: ProviderPeriod;
+};
+
 export type AppSettings = {
   usageMode: UsageMode;
   activeProvider: UsageProvider;
@@ -92,6 +112,7 @@ export type AppSettings = {
 export type DesktopApi = {
   reportFrontendError: (source: "error" | "unhandledrejection", message: string) => Promise<void>;
   getUsageSnapshot: (provider: UsageProvider) => Promise<UsageSnapshot>;
+  getUsageComparison: () => Promise<ProviderComparison>;
   getCachedUsageSnapshot: (provider: UsageProvider) => Promise<UsageSnapshot | null>;
   setUsageMode: (mode: UsageMode, intervalSecs: number) => Promise<AppSettings>;
   getMonitors: () => Promise<MonitorOption[]>;

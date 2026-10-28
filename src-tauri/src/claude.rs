@@ -16,6 +16,10 @@ use std::{
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Reading {
+    #[serde(default)]
+    plan_name: Option<String>,
+    #[serde(default)]
+    plan_error: Option<String>,
     session_id: String,
     updated_at: DateTime<Utc>,
     rate_limits: Vec<RateLimit>,
@@ -319,7 +323,8 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
     Ok(UsageSnapshot {
         cycle_comparisons: Vec::new(),
         provider: super::UsageProvider::Claude,
-        plan_name: "Claude 订阅".into(),
+        plan_name: reading.plan_name.unwrap_or_else(|| "套餐未提供".into()),
+        plan_error: reading.plan_error,
         subscription_expires_at: String::new(),
         windows,
         token_usage: empty_token_usage(),
@@ -571,10 +576,11 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let result = (|| -> Result<(), String> {
             for used in [10, 25] {
-                let reading = json!({"type":"reading","source":"account","sessionId":"test-session","updatedAt":Utc::now(),"rateLimits":[{"kind":"five_hour","percentUsed":used,"resetsAt":(Utc::now()+chrono::Duration::hours(5)).to_rfc3339()}]});
+                let reading = json!({"type":"reading","source":"account","sessionId":"test-session","planName":"Claude Pro","updatedAt":Utc::now(),"rateLimits":[{"kind":"five_hour","percentUsed":used,"resetsAt":(Utc::now()+chrono::Duration::hours(5)).to_rfc3339()}]});
                 collect(&directory, reading.to_string().as_bytes())?;
             }
             assert_eq!(read_snapshot(&directory)?.windows[0].used, 25.0);
+            assert_eq!(read_snapshot(&directory)?.plan_name, "Claude Pro");
             let sample = json!({"type":"sample","id":"test-request-1","timestamp":Utc::now(),"usage":{"model":"claude-opus-5-5","input_tokens":100,"output_tokens":20,"cache_read_input_tokens":200,"cache_creation_input_tokens":50}});
             for _ in 0..2 {
                 collect(&directory, sample.to_string().as_bytes())?;
@@ -619,6 +625,7 @@ mod tests {
             "rateLimits":[{"kind":"five_hour","percentUsed":99}]});
         collect(&directory, reading.to_string().as_bytes()).unwrap();
         assert_eq!(read_snapshot(&directory).unwrap().windows[0].used, 42.5);
+        assert_eq!(read_snapshot(&directory).unwrap().plan_name, "套餐未提供");
         fs::remove_dir_all(directory).unwrap();
     }
 

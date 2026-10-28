@@ -1,6 +1,6 @@
 {
   "name": "codexinfo-usage",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": { "name": "CodexInfo" },
   "description": "通过在线 Claude Code 桥接定时同步账号额度，覆盖 Projects 等入口的消耗"
 }

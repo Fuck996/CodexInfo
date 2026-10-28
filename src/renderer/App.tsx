@@ -375,7 +375,7 @@ export function App() {
             <strong className="brand-title"><span>{providerName.toUpperCase()}</span><em>用量核心</em></strong>
           </div>
           <div className="plan-meta">
-            <span className="plan-badge">{provider === "claude" ? "账号用量" : compactPlanName(snapshot?.planName)}</span>
+            <span className="plan-badge" title={snapshot?.planError ?? snapshot?.planName}>{provider === "claude" ? snapshot?.planName ?? "读取套餐中" : compactPlanName(snapshot?.planName)}</span>
           </div>
         </div>
 
@@ -398,6 +398,7 @@ export function App() {
             </div>
 
             <UsageAnalytics expanded={tokenExpanded} onToggle={toggleTokenExpanded} snapshot={snapshot} />
+            {snapshot.planError && <div className="data-warning" role="status">套餐：{snapshot.planError}</div>}
 
             {provider === "claude" ? (
               <div className="claude-source-note"><strong>Claude 账号额度</strong><p>最近同步：{formatFullDate(snapshot.updatedAt)}</p><p>在线 Code 桥接每 2 分钟查询账号额度，包含 Projects 等入口的消耗。关闭全部 Code 会话后同步暂停。</p><p>Token 明细仅统计已接入的 Code 请求。</p><p>银行重置余额：尚未提供。</p></div>

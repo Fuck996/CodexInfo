@@ -33,6 +33,12 @@ pub(super) struct CycleComparison {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CycleSummary {
+    #[serde(default)]
+    priced_sample_count: usize,
+    #[serde(default)]
+    priced_cost_low_usd: Option<f64>,
+    #[serde(default)]
+    priced_cost_high_usd: Option<f64>,
     cache_write_tokens: f64,
     start_at: String,
     end_at: String,
@@ -171,6 +177,93 @@ fn same_cycle_end(left: DateTime<Utc>, right: DateTime<Utc>, provider: &str) -> 
     left == right || (provider == "claude" && left.timestamp() == right.timestamp())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ProviderComparison {
+    start_at: String,
+    end_at: String,
+    codex: ProviderPeriod,
+    claude: ProviderPeriod,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderPeriod {
+    plan_name: String,
+    summary: CycleSummary,
+    quota_from: String,
+    quota_until: String,
+    endpoint_skew_seconds: i64,
+    percent_per_million_tokens: Option<f64>,
+}
+
+struct WeeklyReadings<'a> {
+    reset: DateTime<Utc>,
+    points: Vec<&'a Observation>,
+}
+
+fn weekly_readings<'a>(history: &'a History, snapshot: &UsageSnapshot, provider: &str) -> Result<WeeklyReadings<'a>, String> {
+    let window = snapshot.windows.iter().find(|window| window.window_duration_mins == 10_080)
+        .ok_or_else(|| format!("{provider} 尚未提供周额度窗口"))?;
+    let reset = DateTime::parse_from_rfc3339(&window.reset_at).map_err(|error| error.to_string())?.with_timezone(&Utc);
+    let points = history.observations.get(provider).into_iter().flatten().filter(|point| {
+        point.at >= reset - Duration::days(7) && point.at < reset && point.windows.iter().any(|candidate| {
+            candidate.id == window.id && candidate.window_duration_mins == 10_080
+                && DateTime::parse_from_rfc3339(&candidate.reset_at)
+                    .is_ok_and(|end| same_cycle_end(end.with_timezone(&Utc), reset, provider))
+        })
+    }).collect::<Vec<_>>();
+    if points.len() < 2 { return Err(format!("{provider} 本周额度采样不足，等待至少两次读数")); }
+    Ok(WeeklyReadings { reset, points })
+}
+
+pub(super) fn compare_providers(
+    history: &History,
+    codex: &UsageSnapshot,
+    claude: &UsageSnapshot,
+    codex_samples: &[TokenUsageSample],
+    claude_samples: &[TokenUsageSample],
+) -> Result<ProviderComparison, String> {
+    let gpt = weekly_readings(history, codex, "codex")?;
+    let cl = weekly_readings(history, claude, "claude")?;
+    let start = gpt.points[0].at.max(cl.points[0].at);
+    let end = gpt.points.last().expect("two readings").at.min(cl.points.last().expect("two readings").at);
+    if end <= start { return Err("两边本周额度尚无共同观测区间，等待后续采样".into()); }
+    Ok(ProviderComparison {
+        start_at: start.to_rfc3339(), end_at: end.to_rfc3339(),
+        codex: compare_period(&gpt, start, end, codex_samples, "codex", &codex.plan_name)?,
+        claude: compare_period(&cl, start, end, claude_samples, "claude", &claude.plan_name)?,
+    })
+}
+
+fn compare_period(
+    readings: &WeeklyReadings<'_>, start: DateTime<Utc>, end: DateTime<Utc>,
+    samples: &[TokenUsageSample], provider: &str, plan: &str,
+) -> Result<ProviderPeriod, String> {
+    let first = readings.points.iter().rposition(|point| point.at <= start).expect("common start has prior reading");
+    let last = readings.points.iter().rposition(|point| point.at <= end).expect("common end has prior reading");
+    let from = readings.points[first].at;
+    let until = readings.points[last].at;
+    let skew = (start - from).num_seconds().max((end - until).num_seconds());
+    if skew > 180 || from >= until { return Err(format!("{provider} 共同区间端点缺少 3 分钟内的额度读数，暂不能比较")); }
+    let points = readings.points[first..=last].iter().map(|point| (**point).clone()).collect::<Vec<_>>();
+    let mut timed = samples.iter().map(|sample| {
+        DateTime::parse_from_rfc3339(&sample.timestamp)
+            .map(|at| (at.with_timezone(&Utc), sample)).map_err(|error| error.to_string())
+    }).collect::<Result<Vec<_>, _>>()?;
+    timed.retain(|(at, _)| *at > start && *at <= end);
+    timed.sort_by_key(|(at, _)| *at);
+    let mut summary = summarize(readings.reset - Duration::days(7), readings.reset, 10_080, &points, &timed, provider);
+    summary.start_at = start.to_rfc3339();
+    summary.end_at = end.to_rfc3339();
+    // 跨平台指标要求额度与请求均落在共同区间；回落和不足 1 个百分点不排名。
+    let percent_per_million_tokens = summary.token_usage.total.filter(|total| *total > 0.0)
+        .filter(|_| summary.observed_percent >= 1.0 && summary.quota_drops == 0)
+        .map(|total| summary.observed_percent / total * 1_000_000.0);
+    Ok(ProviderPeriod { plan_name: plan.into(), summary, quota_from: from.to_rfc3339(),
+        quota_until: until.to_rfc3339(), endpoint_skew_seconds: skew, percent_per_million_tokens })
+}
+
 fn summarize(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
@@ -187,12 +280,14 @@ fn summarize(
     let mut usage = empty_token_usage();
     let mut low = 0.0;
     let mut high = 0.0;
+    let mut priced_sample_count = 0;
     let mut models = BTreeSet::new();
     let mut unknown = BTreeSet::new();
     for sample in &cycle_samples {
         merge_token_usage(&mut usage, &sample.token_usage);
         models.insert(sample.model.clone());
         if let Some((min, max)) = cost(sample, provider) {
+            priced_sample_count += 1;
             low += min;
             high += max;
         } else {
@@ -208,7 +303,7 @@ fn summarize(
                     && DateTime::parse_from_rfc3339(&window.reset_at)
                         .is_ok_and(|reset| same_cycle_end(reset.with_timezone(&Utc), end, provider))
             })?;
-            Some((point.at, window.used / window.total * 100.0))
+            Some((point.at, window.used * 100.0 / window.total))
         })
         .collect::<Vec<_>>();
     let mut drops = 0;
@@ -263,6 +358,9 @@ fn summarize(
     let has_samples = !cycle_samples.is_empty();
     let has_cost = has_samples && unknown.is_empty();
     CycleSummary {
+        priced_sample_count,
+        priced_cost_low_usd: (priced_sample_count > 0).then_some(low),
+        priced_cost_high_usd: (priced_sample_count > 0).then_some(high),
         cache_write_tokens: cycle_samples.iter().map(|sample| sample.cache_write).sum(),
         start_at: start.to_rfc3339(),
         end_at: end.to_rfc3339(),
@@ -291,6 +389,7 @@ fn cost(sample: &TokenUsageSample, provider: &str) -> Option<(f64, f64)> {
     let (input_price, cached_price, output_price, write_low, write_high) = if provider == "codex" {
         let (input, cached, output) = match model {
             "gpt-6.1-sol" => (2.0, 0.1, 10.0),
+            "gpt-6.1-terra" => (1.0, 0.05, 5.0),
             "gpt-6-sol" => (2.0, 0.2, 10.0),
             "gpt-6-astra" => (10.0, 1.0, 50.0),
             "gpt-6-luna" => (0.1, 0.01, 0.5),
@@ -384,8 +483,89 @@ mod tests {
     fn uses_model_price_and_counts_cached_input_once() {
         let mut sample = sample("2026-10-24T01:00:00Z");
         assert_eq!(cost(&sample, "codex"), Some((2.05, 2.05)));
+        sample.model = "gpt-6.1-terra".into();
+        assert_eq!(cost(&sample, "codex"), Some((1.025, 1.025)));
         sample.model = "codex-auto-review".into();
         assert_eq!(cost(&sample, "codex"), None);
+    }
+
+    #[test]
+    fn unknown_models_preserve_priced_subtotal_without_inventing_a_total() {
+        let known = sample("2026-10-24T01:00:00Z");
+        let mut unknown = sample("2026-10-24T02:00:00Z");
+        unknown.model = "codex-auto-review".into();
+        let start = at("2026-10-24T00:00:00Z");
+        let summary = summarize(start, start + Duration::days(7), 10080, &[],
+            &[(at(&known.timestamp), &known), (at(&unknown.timestamp), &unknown)], "codex");
+        assert_eq!(summary.cost_low_usd, None);
+        assert_eq!(summary.priced_cost_low_usd, Some(2.05));
+        assert_eq!(summary.priced_sample_count, 1);
+        assert_eq!(summary.token_usage.total, Some(2_200_000.0));
+    }
+
+    fn at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value).unwrap().with_timezone(&Utc)
+    }
+
+    fn comparison_fixture(provider: &str, reset: &str, readings: &[(&str, f64)]) -> (UsageSnapshot, Vec<Observation>) {
+        let points = readings.iter().map(|(time, used)| serde_json::from_value(json!({
+            "at":time,"windows":[{"id":"weekly","label":"周用量","used":used,"total":100,"resetAt":reset,"windowDurationMins":10080}]
+        })).unwrap()).collect::<Vec<Observation>>();
+        let snapshot = serde_json::from_value(json!({
+            "provider":provider,"planName":provider,"subscriptionExpiresAt":"","windows":points.last().unwrap().windows,
+            "tokenUsage":empty_token_usage(),"creditsRemaining":0,"creditsTotal":0,"resets":[],"updatedAt":readings.last().unwrap().0,
+            "sourcePath":"fixture","accountSource":"usageFile"
+        })).unwrap();
+        (snapshot, points)
+    }
+
+    #[test]
+    fn cross_provider_uses_common_interval_despite_different_weekly_resets() {
+        let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+            ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T01:00:00Z", 12.0), ("2026-10-24T02:00:00Z", 14.0)]);
+        let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
+            ("2026-10-24T00:01:00Z", 20.0), ("2026-10-24T01:59:00Z", 21.0), ("2026-10-24T02:01:00Z", 22.0)]);
+        let mut history = History::default();
+        history.observations.insert("codex".into(), gpt_points);
+        history.observations.insert("claude".into(), cl_points);
+        let records = [sample("2026-10-24T00:00:30Z"), sample("2026-10-24T01:00:00Z"), sample("2026-10-24T02:00:30Z")];
+        let result = compare_providers(&history, &codex, &claude, &records, &records).unwrap();
+        assert_eq!(at(&result.start_at), at("2026-10-24T00:01:00Z"));
+        assert_eq!(at(&result.end_at), at("2026-10-24T02:00:00Z"));
+        assert_eq!(result.codex.summary.sample_count, 1);
+        assert_eq!(result.claude.summary.sample_count, 1);
+        assert!((result.codex.summary.observed_percent - 4.0).abs() < 1e-9);
+        assert!((result.claude.summary.observed_percent - 1.0).abs() < 1e-9);
+        assert_eq!(result.codex.endpoint_skew_seconds, 60);
+        assert_eq!(result.claude.endpoint_skew_seconds, 60);
+    }
+
+    #[test]
+    fn cross_provider_rejects_missing_endpoint_readings() {
+        let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+            ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T02:00:00Z", 12.0)]);
+        let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
+            ("2026-10-24T00:01:00Z", 20.0), ("2026-10-24T02:01:00Z", 21.0)]);
+        let mut history = History::default();
+        history.observations.insert("codex".into(), gpt_points);
+        history.observations.insert("claude".into(), cl_points);
+        assert!(compare_providers(&history, &codex, &claude, &[], &[]).err().unwrap().contains("端点"));
+    }
+
+    #[test]
+    fn cross_provider_does_not_rank_quota_drops_or_missing_tokens() {
+        let (snapshot, points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+            ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T00:01:00Z", 5.0), ("2026-10-24T00:02:00Z", 8.0)]);
+        let mut history = History::default();
+        history.observations.insert("codex".into(), points);
+        let readings = weekly_readings(&history, &snapshot, "codex").unwrap();
+        let records = [sample("2026-10-24T00:01:30Z")];
+        let result = compare_period(&readings, readings.points[0].at, readings.points[2].at, &records, "codex", "Pro").unwrap();
+        assert_eq!(result.summary.quota_drops, 1);
+        assert_eq!(result.percent_per_million_tokens, None);
+        let empty = compare_period(&readings, readings.points[1].at, readings.points[2].at, &[], "codex", "Pro").unwrap();
+        assert_eq!(empty.summary.sample_count, 0);
+        assert_eq!(empty.percent_per_million_tokens, None);
     }
 
     #[test]

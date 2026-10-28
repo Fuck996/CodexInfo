@@ -150,6 +150,8 @@ struct UsageSnapshot {
     #[serde(default)]
     provider: UsageProvider,
     plan_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_error: Option<String>,
     subscription_expires_at: String,
     windows: Vec<UsageWindow>,
     token_usage: TokenUsage,
@@ -491,6 +493,7 @@ fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, S
         cycle_comparisons: Vec::new(),
         provider: UsageProvider::Codex,
         plan_name,
+        plan_error: None,
         subscription_expires_at: String::new(),
         windows,
         token_usage: token_usage_from_session(Some(event)).unwrap_or(TokenUsage {
@@ -2021,6 +2024,7 @@ fn snapshot_from_app_server(app_server: Value, session_token: Option<TokenUsage>
         cycle_comparisons: Vec::new(),
         provider: UsageProvider::Codex,
         plan_name: plan,
+        plan_error: None,
         subscription_expires_at,
         windows,
         token_usage,
@@ -2096,28 +2100,49 @@ fn get_cached_usage_snapshot(app: AppHandle, provider: UsageProvider) -> Result<
 #[tauri::command]
 async fn get_usage_snapshot(app: AppHandle, provider: UsageProvider) -> Result<UsageSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let snapshot = if provider == UsageProvider::Claude {
-            let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
-            let mut snapshot = claude::read_snapshot(&root.join("claude-readings"))?;
-            let state = app.state::<AppState>();
-            let mut token_cache = state.claude_usage_cache.lock().map_err(|error| error.to_string())?;
-            let samples = claude::token_samples(&root.join("claude-readings"), &mut token_cache)?;
-            let mut history = state.analytics_history.lock().map_err(|error| error.to_string())?;
-            analytics::enrich(&root, &mut history, &mut snapshot, &samples)?;
-            snapshot
-        } else {
-            let state = app.state::<AppState>();
-            let mut cached = state.codex_reading.lock().map_err(|error| error.to_string())?;
-            if cached.as_ref().is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(60)) {
-                *cached = Some((Instant::now(), get_usage_snapshot_blocking(app.clone())));
-            }
-            cached.as_ref().expect("Codex reading initialized").1.clone()?
-        };
+        let snapshot = load_usage_snapshot(&app, provider)?;
         set_latest_tray_usage(&app, &snapshot);
         Ok(snapshot)
     })
         .await
         .map_err(|error| format!("用量读取任务失败: {error}"))?
+}
+
+fn load_usage_snapshot(app: &AppHandle, provider: UsageProvider) -> Result<UsageSnapshot, String> {
+    if provider == UsageProvider::Claude {
+        let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
+        let mut snapshot = claude::read_snapshot(&root.join("claude-readings"))?;
+        let state = app.state::<AppState>();
+        let mut token_cache = state.claude_usage_cache.lock().map_err(|error| error.to_string())?;
+        let samples = claude::token_samples(&root.join("claude-readings"), &mut token_cache)?;
+        let mut history = state.analytics_history.lock().map_err(|error| error.to_string())?;
+        analytics::enrich(&root, &mut history, &mut snapshot, &samples)?;
+        Ok(snapshot)
+    } else {
+        let state = app.state::<AppState>();
+        let mut cached = state.codex_reading.lock().map_err(|error| error.to_string())?;
+        if cached.as_ref().is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(60)) {
+            *cached = Some((Instant::now(), get_usage_snapshot_blocking(app.clone())));
+        }
+        cached.as_ref().expect("Codex reading initialized").1.clone()
+    }
+}
+
+#[tauri::command]
+async fn get_usage_comparison(app: AppHandle) -> Result<analytics::ProviderComparison, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex = load_usage_snapshot(&app, UsageProvider::Codex)?;
+        let claude = load_usage_snapshot(&app, UsageProvider::Claude)?;
+        let state = app.state::<AppState>();
+        let (_, codex_samples) = find_session_usage(&state)?;
+        let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
+        let claude_samples = {
+            let mut cache = state.claude_usage_cache.lock().map_err(|error| error.to_string())?;
+            claude::token_samples(&root.join("claude-readings"), &mut cache)?
+        };
+        let history = state.analytics_history.lock().map_err(|error| error.to_string())?;
+        analytics::compare_providers(&history, &codex, &claude, &codex_samples, &claude_samples)
+    }).await.map_err(|error| format!("同周期对比任务失败: {error}"))?
 }
 
 fn get_usage_snapshot_blocking(app: AppHandle) -> Result<UsageSnapshot, String> {
@@ -2157,7 +2182,6 @@ fn get_usage_snapshot_blocking(app: AppHandle) -> Result<UsageSnapshot, String> 
     let mut history = state.analytics_history.lock().map_err(|error| error.to_string())?;
     analytics::enrich(&root, &mut history, &mut snapshot, &token_samples)?;
     write_usage_cache(&app, &snapshot)?;
-    set_latest_tray_usage(&app, &snapshot);
     Ok(snapshot)
 }
 
@@ -2846,6 +2870,7 @@ pub fn run() {
             diagnostics::report_frontend_error,
             get_cached_usage_snapshot,
             get_usage_snapshot,
+            get_usage_comparison,
             get_settings,
             set_usage_mode,
             monitors::get_monitors,
