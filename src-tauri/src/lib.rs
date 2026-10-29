@@ -1,6 +1,7 @@
 mod diagnostics;
 mod claude;
 mod analytics;
+mod sampling;
 mod monitors;
 use monitors::{target_monitor, get_monitors, set_selected_monitor};
 
@@ -2935,6 +2936,15 @@ pub fn run() {
             }
             start_dock_z_order_maintenance(app.handle(), state.clone());
             start_dock_z_order_watcher(app.handle().clone(), state.clone());
+            let sampling_app = app.handle().clone();
+            let sampler = sampling::Sampler::start(Duration::from_secs(30), move |provider| {
+                let snapshot = load_usage_snapshot(&sampling_app, provider, false)?;
+                set_latest_tray_usage(&sampling_app, &snapshot);
+                let main_visible = sampling_app.get_webview_window("main")
+                    .map(|window| window.is_visible());
+                Ok(format!("updated_at={} main_visible={main_visible:?}", snapshot.updated_at))
+            })?;
+            app.manage(sampler);
             Ok(())
         })
         .on_window_event(move |window, event| {
@@ -2964,12 +2974,20 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_, event| match event {
+        .run(|app, event| match event {
             tauri::RunEvent::Ready => diagnostics::ready(),
             tauri::RunEvent::ExitRequested { code, .. } => {
+                if let Some(sampler) = app.try_state::<sampling::Sampler>() { sampler.request_stop(); }
                 diagnostics::record(&format!("exit requested code={code:?}"));
             }
-            tauri::RunEvent::Exit => diagnostics::event_loop_exit(),
+            tauri::RunEvent::Exit => {
+                if let Some(sampler) = app.try_state::<sampling::Sampler>() {
+                    if let Err(error) = sampler.shutdown() {
+                        diagnostics::record(&format!("usage_sampler shutdown_failed error={error}"));
+                    }
+                }
+                diagnostics::event_loop_exit();
+            }
             tauri::RunEvent::WindowEvent { label, event, .. } => match event {
                 tauri::WindowEvent::CloseRequested { .. } => {
                     diagnostics::record(&format!("window close requested label={label}"));
