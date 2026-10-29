@@ -117,10 +117,14 @@ function quotaWindows(body) {
   for (const kind of ["five_hour", "seven_day"]) {
     const value = body[kind];
     if (value === null || value === undefined) continue;
-    if (typeof value !== "object" || !Number.isFinite(value.utilization)
-        || value.utilization < 0 || value.utilization > 100
-        || typeof value.resets_at !== "string" || !Number.isFinite(Date.parse(value.resets_at))) {
-      throw new Error(`Claude ${kind} 额度字段无效`);
+    if (typeof value !== "object" || Array.isArray(value)) throw new Error(`Claude ${kind} 额度结构无效`);
+    if (value.utilization !== null && (!Number.isFinite(value.utilization)
+        || value.utilization < 0 || value.utilization > 100)) {
+      throw new Error(`Claude ${kind}.utilization 无效：应为 0–100 的数值或 null`);
+    }
+    // Claude 的窗口读数和重置时间可独立为 null，不能补成零或虚构时间。
+    if (value.resets_at !== null && (typeof value.resets_at !== "string" || !Number.isFinite(Date.parse(value.resets_at)))) {
+      throw new Error(`Claude ${kind}.resets_at 无效：应为时间字符串或 null`);
     }
     windows.push({ kind, percentUsed: value.utilization, resetsAt: value.resets_at });
   }

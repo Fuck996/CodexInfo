@@ -103,7 +103,7 @@ fn claim_poll(directory: &Path, now: DateTime<Utc>) -> Result<bool, String> {
 #[serde(rename_all = "camelCase")]
 struct RateLimit {
     kind: String,
-    percent_used: f64,
+    percent_used: Option<f64>,
     resets_at: Option<DateTime<Utc>>,
 }
 
@@ -139,7 +139,7 @@ fn validate(reading: &Reading) -> Result<(), String> {
         return Err("Claude 会话标识无效".into());
     }
     for limit in &reading.rate_limits {
-        if !limit.percent_used.is_finite() || limit.percent_used < 0.0 {
+        if limit.percent_used.is_some_and(|used| !used.is_finite() || used < 0.0) {
             return Err("Claude 用量百分比无效".into());
         }
     }
@@ -210,14 +210,19 @@ pub fn handle_cli() -> bool {
     let mut args = std::env::args_os().skip(1);
     let command = args.next();
     let claim = command.as_deref() == Some(std::ffi::OsStr::new("--claude-poll-claim"));
-    if !claim && command.as_deref() != Some(std::ffi::OsStr::new("--claude-usage")) {
+    let install_bridge = command.as_deref() == Some(std::ffi::OsStr::new("--claude-install"));
+    if !claim && !install_bridge && command.as_deref() != Some(std::ffi::OsStr::new("--claude-usage")) {
         return false;
     }
     let result = args
         .next()
         .ok_or_else(|| "缺少 Claude 用量目录".to_string())
         .and_then(|directory| {
-            if claim {
+            if install_bridge {
+                let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+                println!("{}", install(Path::new(&directory), &executable)?);
+                Ok(())
+            } else if claim {
                 let granted = claim_poll(Path::new(&directory), Utc::now())?;
                 println!("{}", serde_json::json!({"granted":granted}));
                 Ok(())
@@ -291,6 +296,7 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
     if now.signed_duration_since(reading.updated_at).num_seconds() > MAX_READING_AGE_SECS {
         return Err(format!("Claude 账号用量超过 5 分钟未更新（最近读数：{}）。请确认 Code 桥接在线；Projects 聊天不会加载 Code 插件。", reading.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S")));
     }
+    let mut unavailable_windows = Vec::new();
     let windows = reading
         .rate_limits
         .into_iter()
@@ -300,13 +306,17 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
                 "seven_day" => ("7 天用量", 10_080),
                 _ => return None,
             };
+            let Some(used) = limit.percent_used else {
+                unavailable_windows.push(label);
+                return None;
+            };
             if limit.resets_at.is_some_and(|reset| reset <= now) {
                 return None;
             }
             Some(UsageWindow {
                 id: limit.kind,
                 label: label.into(),
-                used: limit.percent_used,
+                used,
                 total: 100.0,
                 reset_at: limit
                     .resets_at
@@ -318,6 +328,9 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
         })
         .collect::<Vec<_>>();
     if windows.is_empty() {
+        if !unavailable_windows.is_empty() {
+            return Err(format!("Claude 暂未提供{}的百分比读数，等待下一次查询。", unavailable_windows.join("、")));
+        }
         return Err("Claude 账号暂无有效额度窗口，等待下一次查询；不会把过期读数补为零。".into());
     }
     Ok(UsageSnapshot {
@@ -325,6 +338,7 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
         provider: super::UsageProvider::Claude,
         plan_name: reading.plan_name.unwrap_or_else(|| "套餐未提供".into()),
         plan_error: reading.plan_error,
+        usage_warning: (!unavailable_windows.is_empty()).then(|| format!("{}：Claude 暂未提供百分比读数", unavailable_windows.join("、"))),
         subscription_expires_at: String::new(),
         windows,
         token_usage: empty_token_usage(),
@@ -615,6 +629,52 @@ mod tests {
         let reading = json!({"type":"reading","source":"account","sessionId":"account","updatedAt":timestamp,
             "rateLimits":[{"kind":"five_hour","percentUsed":42.5,"resetsAt":(Utc::now()+chrono::Duration::hours(5)).to_rfc3339()}]});
         collect(directory, reading.to_string().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn nullable_reset_preserves_real_usage_and_weekly_analytics() {
+        let directory = test_directory("nullable-reset");
+        let reset = (Utc::now() + chrono::Duration::days(5)).to_rfc3339();
+        let reading = json!({"type":"reading","source":"account","sessionId":"account","updatedAt":Utc::now(),
+            "rateLimits":[{"kind":"five_hour","percentUsed":12.5,"resetsAt":null},
+                {"kind":"seven_day","percentUsed":70,"resetsAt":reset}]});
+        collect(&directory, reading.to_string().as_bytes()).unwrap();
+        let mut snapshot = read_snapshot(&directory).unwrap();
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(snapshot.windows[0].used, 12.5);
+        assert!(snapshot.windows[0].reset_at.is_empty());
+        assert_eq!(snapshot.windows[1].used, 70.0);
+        assert!(snapshot.usage_warning.is_none());
+        crate::analytics::enrich(&directory, &mut crate::analytics::History::default(), &mut snapshot, &[]).unwrap();
+        assert_eq!(snapshot.cycle_comparisons.len(), 1);
+        assert_eq!(serde_json::to_value(&snapshot.cycle_comparisons).unwrap()[0]["windowId"], "seven_day");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unknown_window_usage_is_explicit_and_does_not_discard_weekly_readings() {
+        let directory = test_directory("nullable-utilization");
+        let reading = json!({"type":"reading","source":"account","sessionId":"account","updatedAt":Utc::now(),
+            "rateLimits":[{"kind":"five_hour","percentUsed":null,"resetsAt":null},
+                {"kind":"seven_day","percentUsed":70,"resetsAt":(Utc::now()+chrono::Duration::days(5)).to_rfc3339()}]});
+        collect(&directory, reading.to_string().as_bytes()).unwrap();
+        let snapshot = read_snapshot(&directory).unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].id, "seven_day");
+        assert_eq!(snapshot.windows[0].used, 70.0);
+        assert!(snapshot.usage_warning.unwrap().contains("5 小时用量"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn entirely_unknown_usage_never_becomes_zero_usage() {
+        let directory = test_directory("all-nullable-utilization");
+        let reading = json!({"type":"reading","source":"account","sessionId":"account","updatedAt":Utc::now(),
+            "rateLimits":[{"kind":"five_hour","percentUsed":null,"resetsAt":null},
+                {"kind":"seven_day","percentUsed":null,"resetsAt":null}]});
+        collect(&directory, reading.to_string().as_bytes()).unwrap();
+        assert!(read_snapshot(&directory).unwrap_err().contains("暂未提供5 小时用量、7 天用量的百分比读数"));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

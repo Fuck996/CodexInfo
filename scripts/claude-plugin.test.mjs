@@ -114,12 +114,51 @@ test("rate limiting is exported with server retry delay and no stale snapshot", 
   assert.match(h.exports[0].reading.message, /HTTP 429/);
 });
 
+test("nullable quota fields preserve independent readings without inventing usage or reset times", async () => {
+  for (const fiveHour of [
+    { utilization: 0, resets_at: null },
+    { utilization: 12.5, resets_at: null },
+    { utilization: null, resets_at: "2027-01-01T05:00:00Z" },
+    { utilization: null, resets_at: null }
+  ]) {
+    const h = harness();
+    const fetch = h.api.http.fetch;
+    h.api.http.fetch = async (url, init) => url.endsWith("/usage")
+      ? { ok: true, text: JSON.stringify({ five_hour: fiveHour, seven_day: { utilization: 70, resets_at: "2027-01-07T00:00:00Z" } }) }
+      : fetch(url, init);
+    await h.start();
+    await waitForExport(h.exports, 1);
+    assert.equal(h.exports[0].reading.type, "reading");
+    assert.deepEqual(h.exports[0].reading.rateLimits, [
+      { kind: "five_hour", percentUsed: fiveHour.utilization, resetsAt: fiveHour.resets_at },
+      { kind: "seven_day", percentUsed: 70, resetsAt: "2027-01-07T00:00:00Z" }
+    ]);
+  }
+});
+
+test("malformed quota fields remain failures with the offending field identified", async () => {
+  for (const [fiveHour, field] of [
+    [{ utilization: "0", resets_at: null }, "utilization"],
+    [{ resets_at: null }, "utilization"],
+    [{ utilization: 0, resets_at: 123 }, "resets_at"],
+    [{ utilization: 0, resets_at: "invalid" }, "resets_at"],
+    [{ utilization: 0 }, "resets_at"]
+  ]) {
+    const h = harness();
+    h.api.http.fetch = async () => ({ ok: true, text: JSON.stringify({ five_hour: fiveHour }) });
+    await h.start();
+    await waitForExport(h.exports, 1);
+    assert.equal(h.exports[0].reading.type, "syncFailure");
+    assert.ok(h.exports[0].reading.message.includes(`five_hour.${field}`));
+  }
+});
+
 test("invalid account fields and missing authorization fail explicitly", async () => {
   const h = harness();
   h.api.http.fetch = async () => ({ ok: true, text: '{"five_hour":{"utilization":150,"resets_at":"2027-01-01T00:00:00Z"}}' });
   await h.start();
   assert.equal(h.exports[0].reading.type, "syncFailure");
-  assert.match(h.exports[0].reading.message, /额度字段无效/);
+  assert.match(h.exports[0].reading.message, /five_hour\.utilization/);
   const missing = harness();
   missing.api.session.authorize = async () => null;
   await missing.start();

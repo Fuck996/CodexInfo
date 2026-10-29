@@ -152,6 +152,8 @@ struct UsageSnapshot {
     plan_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage_warning: Option<String>,
     subscription_expires_at: String,
     windows: Vec<UsageWindow>,
     token_usage: TokenUsage,
@@ -494,6 +496,7 @@ fn snapshot_from_token_count(event: &TokenCountEvent) -> Result<UsageSnapshot, S
         provider: UsageProvider::Codex,
         plan_name,
         plan_error: None,
+        usage_warning: None,
         subscription_expires_at: String::new(),
         windows,
         token_usage: token_usage_from_session(Some(event)).unwrap_or(TokenUsage {
@@ -2025,6 +2028,7 @@ fn snapshot_from_app_server(app_server: Value, session_token: Option<TokenUsage>
         provider: UsageProvider::Codex,
         plan_name: plan,
         plan_error: None,
+        usage_warning: None,
         subscription_expires_at,
         windows,
         token_usage,

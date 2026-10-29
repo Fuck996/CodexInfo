@@ -37,6 +37,7 @@ export type UsageSnapshot = {
   provider: UsageProvider;
   planName: string;
   planError?: string | null;
+  usageWarning?: string | null;
   subscriptionExpiresAt: string;
   windows: UsageWindow[];
   tokenUsage: TokenUsage;

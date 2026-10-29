@@ -409,6 +409,7 @@ export function App() {
 
             <UsageAnalytics view={analyticsView} onToggle={toggleTokenExpanded} snapshot={snapshot} />
             {snapshot.planError && <div className="data-warning" role="status">套餐：{snapshot.planError}</div>}
+            {snapshot.usageWarning && <div className="data-warning" role="status">{snapshot.usageWarning}</div>}
 
             {provider === "claude" ? (
               <div className="claude-source-note"><strong>Claude 账号额度</strong><p>最近同步：{formatFullDate(snapshot.updatedAt)}</p><p>在线 Code 桥接每 2 分钟查询账号额度，包含 Projects 等入口的消耗。关闭全部 Code 会话后同步暂停。</p><p>Token 明细仅统计已接入的 Code 请求。</p><p>银行重置余额：尚未提供。</p></div>
@@ -645,7 +646,7 @@ function UsageCard({ window }: { window: UsageWindow }) {
           已用 {numberFormatter.format(Math.round(window.used))}
           {isPercent ? "%" : ""}
         </span>
-        <span>重置 {formatDate(window.resetAt)}</span>
+        <span>{window.resetAt ? `重置 ${formatDate(window.resetAt)}` : "重置时间暂未提供"}</span>
       </div>
       <div className="meter" aria-label={`${window.label} 已用 ${Math.round(usedPercent)}%`}>
         <span style={{ width: `${usedPercent}%` }} />
