@@ -298,6 +298,32 @@ button:disabled, select:disabled { opacity: .55; cursor: wait; }
 .analytics-details { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }
 .analytics-details summary { color: var(--muted-strong); font-size: 13px; cursor: pointer; }
 .analytics-details p { font-size: 13px; }
+.quota-totals { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.quota-provider { display: flex; flex-direction: column; gap: 5px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
+.quota-provider-name { color: var(--accent); font-size: 16px; font-weight: 600; }
+.quota-provider[data-series="1"] .quota-provider-name { color: #6fb8ff; }
+.quota-provider > strong { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px; color: var(--text); font-size: 28px; line-height: 1.3; font-variant-numeric: tabular-nums; }
+.quota-provider small { color: var(--muted-strong); font-size: 13px; font-weight: 400; }
+.quota-provider > span:last-child { color: var(--muted-strong); font-size: 13px; font-variant-numeric: tabular-nums; }
+.analytics-body .quota-verdict { margin: 12px 0 4px; color: var(--text); font-size: 15px; }
+.quota-trend { margin: 14px 0 4px; }
+.quota-trend figcaption { margin-bottom: 8px; }
+.quota-legend { display: flex; justify-content: flex-end; gap: 18px; font-size: 14px; color: var(--muted-strong); }
+.quota-legend > span { display: flex; align-items: center; gap: 6px; }
+.quota-legend i { display: inline-block; width: 20px; border-top: 3px solid var(--accent); }
+.quota-legend [data-series="1"] i { border-color: #6fb8ff; border-top-style: dashed; }
+.quota-trend svg { display: block; width: 100%; overflow: visible; }
+.quota-trend text { fill: var(--muted-strong); font-size: 13px; font-variant-numeric: tabular-nums; }
+.quota-grid { stroke: var(--line-quiet); }
+.quota-series { stroke: var(--accent); }
+.quota-series[data-series="1"] { stroke: #6fb8ff; }
+.quota-series path { fill: none; stroke-width: 2.5; stroke-linejoin: round; }
+.quota-series[data-series="1"] path { stroke-dasharray: 7 4; }
+.quota-series .quota-gap { stroke-dasharray: 2 6; opacity: .6; }
+.quota-series circle { fill: #111615; stroke-width: 2.5; }
+.quota-series[data-series="1"] circle { fill: none; }
+.quota-series circle:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+.analytics-body .quota-scope { margin: 4px 0; font-size: 13px; color: var(--muted-strong); }
 
 .chrome {
   display: flex;

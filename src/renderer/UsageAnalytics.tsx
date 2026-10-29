@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { ChevronDown, ChevronUp, Database, X } from "lucide-react";
-import type { CycleSummary, ProviderComparison, UsageSnapshot } from "../shared/types";
+import type { CycleSummary, ProviderComparison, ProviderPeriod, UsageSnapshot } from "../shared/types";
 import { desktopApi } from "./desktopApi";
 
 type View = "cycle" | "providers";
@@ -88,7 +88,7 @@ export function UsageComparison({ snapshot, view, onViewChange, contentRef }: {
   </div></section></div>;
 }
 
-function item(label: string, cycle: CycleSummary | null | undefined, metric: Metric, efficiency?: number | null): ChartItem {
+function item(label: string, cycle: CycleSummary | null | undefined, metric: Metric): ChartItem {
   if (!cycle) return { label, value: null, upper: null, text: "暂无记录" };
   let value: number | null = null;
   let upper: number | null = null;
@@ -109,7 +109,7 @@ function item(label: string, cycle: CycleSummary | null | undefined, metric: Met
       if (cycle.costLowUsd == null && value != null) note = "部分";
     }
   } else {
-    value = efficiency !== undefined ? efficiency : cycle.tokensPerPercent ? 1_000_000 / cycle.tokensPerPercent : null;
+    value = cycle.tokensPerPercent ? 1_000_000 / cycle.tokensPerPercent : null;
     text = value == null ? "无法计算" : `${value.toFixed(2)}%`;
   }
   return { label, value, upper: upper ?? value, text, note };
@@ -191,7 +191,6 @@ function CycleChart({ snapshot }: { snapshot: UsageSnapshot | null }) {
 function CrossProviderComparison() {
   const [data, setData] = useState<ProviderComparison | null>(null);
   const [error, setError] = useState("");
-  const [metric, setMetric] = useState<Metric>("quota");
   useEffect(() => {
     let active = true;
     let inFlight = false;
@@ -210,20 +209,89 @@ function CrossProviderComparison() {
   }, []);
   if (error) return <div className="comparison-state" role="status"><strong>暂时无法对比</strong><p>{error}</p></div>;
   if (!data) return <div className="comparison-state" role="status">正在对齐两边读数…</div>;
+  return <QuotaComparison data={data} />;
+}
+
+export function QuotaComparison({ data }: { data: ProviderComparison }) {
   const periods = [data.codex, data.claude];
+  const names = ["Codex", "Claude"];
+  const hours = (Date.parse(data.endAt) - Date.parse(data.startAt)) / 3_600_000;
+  const duration = hours >= 1 ? `${hours.toFixed(1)} 小时` : hours >= 1 / 60 ? `${Math.round(hours * 60)} 分钟` : `${Math.round(hours * 3600)} 秒`;
+  const a = data.codex.consumedPercent;
+  const b = data.claude.consumedPercent;
+  let verdict = "额度有回落，本段暂不判断高低";
+  if (a != null && b != null) {
+    const difference = Math.abs(a - b);
+    verdict = difference < 1e-9 ? "本段周额度消耗相同"
+      : `${a > b ? "Codex" : "Claude"}多消耗 ${difference.toFixed(1)} 个百分点`;
+  }
   return <div className="analytics-body">
-    <p className="comparison-period">{range({ ...data.codex.summary, startAt: data.startAt, endAt: data.endAt })}</p>
-    <MetricTabs metric={metric} onChange={setMetric} />
-    <ComparisonBars metric={metric} items={[
-      item("Codex", data.codex.summary, metric, data.codex.percentPerMillionTokens),
-      item("Claude", data.claude.summary, metric, data.claude.percentPerMillionTokens)
-    ]} />
-    {data.claude.summary.sampleCount === 0 && <p className="analytics-status">Claude Token：Projects / 普通聊天不提供采集数据</p>}
+    <p className="comparison-period">{date.format(new Date(data.startAt))} — {date.format(new Date(data.endAt))} · {duration}</p>
+    <div className="quota-totals" aria-label="本段周额度消耗">{periods.map((period, index) =>
+      <div className="quota-provider" data-series={index} key={names[index]}>
+        <span className="quota-provider-name">{names[index]}</span>
+        <strong>{period.consumedPercent == null ? "有回落" : period.consumedPercent.toFixed(1)}{period.consumedPercent != null && <small>个百分点</small>}</strong>
+        <span>{period.percentPerHour == null ? "本段不比较" : `平均 ${period.percentPerHour.toFixed(2)} / 小时`}</span>
+      </div>)}</div>
+    <p className="quota-verdict" role="status">{verdict}</p>
+    <QuotaTrend data={data} />
+    <p className="quota-scope">比较真实账号耗额，包含 Projects 和普通聊天。</p>
     <details className="analytics-details"><summary>统计说明与明细</summary>
-      <DetailTable names={["Codex", "Claude"]} cycles={periods.map((period) => period.summary)} />
-      {periods.map((period, index) => <p key={index}>{index === 0 ? "Codex" : "Claude"}：{period.planName}；历史请求 {period.recordedSampleCount} 条；最近记录 {period.lastRecordedAt ? date.format(new Date(period.lastRecordedAt)) : "暂无"}；端点偏差 ≤ {period.endpointSkewSeconds} 秒。</p>)}
-      <p>只比较两边具有配对额度读数的共同区间，端点偏差不超过 3 分钟。Token 为同一时间段的本机记录，周额度包含账号各入口；不同模型、缓存和分词器会影响结果。</p>
-      <p>每百万 Token 耗额 = 周额度增长 ÷ Token × 100 万。增长不足 1 个百分点、额度回落或 Token 缺失时不计算。Projects / 普通聊天不经过 Code 插件，不能用额度百分比反推 Token。</p>
+      <table><thead><tr><th>周额度</th>{names.map((name) => <th key={name}>{name}</th>)}</tr></thead><tbody>
+        <tr><th>套餐</th>{periods.map((period, index) => <td key={index}>{period.planName}</td>)}</tr>
+        <tr><th>起点已用</th>{periods.map((period, index) => <td key={index}>{period.usedFromPercent.toFixed(1)}%</td>)}</tr>
+        <tr><th>终点已用</th>{periods.map((period, index) => <td key={index}>{period.usedUntilPercent.toFixed(1)}%</td>)}</tr>
+        <tr><th>有效采样</th>{periods.map((period, index) => <td key={index}>{period.trend.length} 次</td>)}</tr>
+        <tr><th>端点偏差</th>{periods.map((period, index) => <td key={index}>≤ {period.endpointSkewSeconds} 秒</td>)}</tr>
+        <tr><th>额度回落</th>{periods.map((period, index) => <td key={index}>{period.quotaDrops} 次</td>)}</tr>
+      </tbody></table>
+      <p>本段耗额 = 周额度已用百分比的增长；平均每小时耗额 = 本段耗额 ÷ 共同区间小时数。两边使用同一时间段，端点采用此前最近且不超过 3 分钟的读数，不跨周重置。</p>
+      <p>折线从各自起点归零。阶梯表示实际采样，虚线连接超过 3 分钟的采样间断，不推测间断内的消耗时刻。额度回落时保留原始起止读数，本段不排名。</p>
+      <p>此处不依赖 Token，也不估算普通聊天的 Token。消耗高低反映各自实际使用情况，不代表相同任务的模型效率或套餐总容量。单个平台的 Token 和 API 成本仍在「本周期 / 上周期」中查看。</p>
     </details>
   </div>;
+}
+
+function quotaPaths(period: ProviderPeriod, start: number, end: number, max: number) {
+  const x = (at: string) => 44 + Math.max(0, Date.parse(at) - start) / (end - start) * 340;
+  const y = (used: number) => 174 - (used - period.usedFromPercent) / max * 144;
+  let solid = "";
+  let gaps = "";
+  for (let i = 0; i < period.trend.length; i++) {
+    const point = period.trend[i];
+    const previous = period.trend[i - 1];
+    if (!previous) solid = `M${x(point.at)},${y(point.usedPercent)}`;
+    else if (Date.parse(point.at) - Date.parse(previous.at) > 180_000) {
+      gaps += `M${x(previous.at)},${y(previous.usedPercent)} L${x(point.at)},${y(point.usedPercent)}`;
+      solid += ` M${x(point.at)},${y(point.usedPercent)}`;
+    } else solid += ` H${x(point.at)} V${y(point.usedPercent)}`;
+  }
+  solid += ` H384`;
+  return { solid, gaps };
+}
+
+function QuotaTrend({ data }: { data: ProviderComparison }) {
+  const periods = [data.codex, data.claude];
+  const names = ["Codex", "Claude"];
+  const start = Date.parse(data.startAt);
+  const end = Date.parse(data.endAt);
+  const max = Math.max(1, ...periods.map((period) => period.consumedPercent ?? 0));
+  const clock = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  return <figure className="comparison-chart quota-trend">
+    <figcaption><strong>累计消耗走势</strong><span>周额度百分点</span></figcaption>
+    <div className="quota-legend" aria-label="折线图图例">{names.map((name, index) => <span key={name} data-series={index}><i />{name}</span>)}</div>
+    <svg viewBox="0 0 400 210" role="img" aria-label="Codex 与 Claude 同一时段累计周额度消耗折线图">
+      <desc>两条线从各自起点归零，越高表示本段消耗越多。主卡片显示最终消耗和平均速度，统计说明中提供原始起止读数。</desc>
+      {[0, max / 2, max].map((tick) => <g key={tick}><line className="quota-grid" x1="44" x2="384" y1={174 - tick / max * 144} y2={174 - tick / max * 144} /><text x="36" y={178 - tick / max * 144} textAnchor="end">{tick.toFixed(1)}</text></g>)}
+      <text x="44" y="201">{clock.format(new Date(start))}</text><text x="384" y="201" textAnchor="end">{clock.format(new Date(end))}</text>
+      {periods.map((period, index) => {
+        if (period.consumedPercent == null) return null;
+        const paths = quotaPaths(period, start, end, max);
+        return <g className="quota-series" data-series={index} key={names[index]}>
+          <path d={paths.solid} /><path className="quota-gap" d={paths.gaps} />
+          <circle cx="384" cy={174 - period.consumedPercent / max * 144} r={index === 0 ? 4 : 6} tabIndex={0} aria-label={`${names[index]}本段消耗 ${period.consumedPercent.toFixed(1)} 个百分点`}><title>{names[index]}：{period.consumedPercent.toFixed(1)} 个百分点</title></circle>
+        </g>;
+      })}
+    </svg>
+  </figure>;
 }

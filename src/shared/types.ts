@@ -82,13 +82,15 @@ export type CycleComparison = {
 
 export type ProviderPeriod = {
   planName: string;
-  recordedSampleCount: number;
-  lastRecordedAt: string | null;
-  summary: CycleSummary;
   quotaFrom: string;
   quotaUntil: string;
   endpointSkewSeconds: number;
-  percentPerMillionTokens: number | null;
+  usedFromPercent: number;
+  usedUntilPercent: number;
+  consumedPercent: number | null;
+  percentPerHour: number | null;
+  quotaDrops: number;
+  trend: Array<{ at: string; usedPercent: number }>;
 };
 
 export type ProviderComparison = {

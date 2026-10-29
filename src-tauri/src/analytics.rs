@@ -57,11 +57,10 @@ struct CycleSummary {
     quota_drops: usize,
 }
 
-pub(super) fn enrich(
+pub(super) fn record_snapshot(
     root: &Path,
     history: &mut History,
-    snapshot: &mut UsageSnapshot,
-    samples: &[TokenUsageSample],
+    snapshot: &UsageSnapshot,
 ) -> Result<(), String> {
     let provider = snapshot.provider.label().to_lowercase();
     let path = root.join(format!("quota-history-{provider}.jsonl"));
@@ -100,6 +99,18 @@ pub(super) fn enrich(
         writeln!(file, "{serialized}").map_err(|error| format!("记录额度历史失败: {error}"))?;
         observations.push(observation);
     }
+    Ok(())
+}
+
+pub(super) fn enrich(
+    root: &Path,
+    history: &mut History,
+    snapshot: &mut UsageSnapshot,
+    samples: &[TokenUsageSample],
+) -> Result<(), String> {
+    record_snapshot(root, history, snapshot)?;
+    let provider = snapshot.provider.label().to_lowercase();
+    let observations = history.observations.get(&provider).expect("history initialized");
     let mut points = observations.clone();
     for sample in samples {
         if sample.windows.is_empty() {
@@ -190,17 +201,26 @@ pub(super) struct ProviderComparison {
 #[serde(rename_all = "camelCase")]
 struct ProviderPeriod {
     plan_name: String,
-    recorded_sample_count: usize,
-    last_recorded_at: Option<String>,
-    summary: CycleSummary,
     quota_from: String,
     quota_until: String,
     endpoint_skew_seconds: i64,
-    percent_per_million_tokens: Option<f64>,
+    used_from_percent: f64,
+    used_until_percent: f64,
+    consumed_percent: Option<f64>,
+    percent_per_hour: Option<f64>,
+    quota_drops: usize,
+    trend: Vec<QuotaPoint>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaPoint {
+    at: String,
+    used_percent: f64,
 }
 
 struct WeeklyReadings<'a> {
-    reset: DateTime<Utc>,
+    window_id: String,
     points: Vec<&'a Observation>,
 }
 
@@ -216,23 +236,21 @@ fn weekly_readings<'a>(history: &'a History, snapshot: &UsageSnapshot, provider:
         })
     }).collect::<Vec<_>>();
     if points.len() < 2 { return Err(format!("{provider} 本周额度采样不足，等待至少两次读数")); }
-    Ok(WeeklyReadings { reset, points })
+    Ok(WeeklyReadings { window_id: window.id.clone(), points })
 }
 
 pub(super) fn compare_providers(
     history: &History,
     codex: &UsageSnapshot,
     claude: &UsageSnapshot,
-    codex_samples: &[TokenUsageSample],
-    claude_samples: &[TokenUsageSample],
 ) -> Result<ProviderComparison, String> {
     let gpt = weekly_readings(history, codex, "codex")?;
     let cl = weekly_readings(history, claude, "claude")?;
     let (start, end) = common_bounds(&gpt, &cl)?;
     Ok(ProviderComparison {
         start_at: start.to_rfc3339(), end_at: end.to_rfc3339(),
-        codex: compare_period(&gpt, start, end, codex_samples, "codex", &codex.plan_name)?,
-        claude: compare_period(&cl, start, end, claude_samples, "claude", &claude.plan_name)?,
+        codex: compare_period(&gpt, start, end, &codex.plan_name)?,
+        claude: compare_period(&cl, start, end, &claude.plan_name)?,
     })
 }
 
@@ -272,32 +290,28 @@ fn common_bounds(left: &WeeklyReadings<'_>, right: &WeeklyReadings<'_>) -> Resul
 
 fn compare_period(
     readings: &WeeklyReadings<'_>, start: DateTime<Utc>, end: DateTime<Utc>,
-    samples: &[TokenUsageSample], provider: &str, plan: &str,
+    plan: &str,
 ) -> Result<ProviderPeriod, String> {
     let first = readings.points.iter().rposition(|point| point.at <= start).expect("common start has prior reading");
     let last = readings.points.iter().rposition(|point| point.at <= end).expect("common end has prior reading");
     let from = readings.points[first].at;
     let until = readings.points[last].at;
     let skew = (start - from).num_seconds().max((end - until).num_seconds());
-    if skew > 180 || from >= until { return Err(format!("{provider} 共同区间端点缺少 3 分钟内的额度读数，暂不能比较")); }
-    let points = readings.points[first..=last].iter().map(|point| (**point).clone()).collect::<Vec<_>>();
-    let mut timed = samples.iter().map(|sample| {
-        DateTime::parse_from_rfc3339(&sample.timestamp)
-            .map(|at| (at.with_timezone(&Utc), sample)).map_err(|error| error.to_string())
-    }).collect::<Result<Vec<_>, _>>()?;
-    timed.sort_by_key(|(at, _)| *at);
-    let last_recorded_at = timed.last().map(|(at, _)| at.to_rfc3339());
-    timed.retain(|(at, _)| *at > start && *at <= end);
-    let mut summary = summarize(readings.reset - Duration::days(7), readings.reset, 10_080, &points, &timed, provider);
-    summary.start_at = start.to_rfc3339();
-    summary.end_at = end.to_rfc3339();
-    // 跨平台指标要求额度与请求均落在共同区间；回落和不足 1 个百分点不排名。
-    let percent_per_million_tokens = summary.token_usage.total.filter(|total| *total > 0.0)
-        .filter(|_| summary.observed_percent >= 1.0 && summary.quota_drops == 0)
-        .map(|total| summary.observed_percent / total * 1_000_000.0);
-    Ok(ProviderPeriod { plan_name: plan.into(), recorded_sample_count: samples.len(), last_recorded_at,
-        summary, quota_from: from.to_rfc3339(),
-        quota_until: until.to_rfc3339(), endpoint_skew_seconds: skew, percent_per_million_tokens })
+    if skew > 180 || from >= until { return Err(format!("{plan} 共同区间端点缺少 3 分钟内的额度读数，暂不能比较")); }
+    let trend = readings.points[first..=last].iter().map(|point| {
+        let window = point.windows.iter().find(|window| window.id == readings.window_id && window.window_duration_mins == 10_080)
+            .expect("weekly reading has a weekly window");
+        QuotaPoint { at: point.at.to_rfc3339(), used_percent: window.used * 100.0 / window.total }
+    }).collect::<Vec<_>>();
+    let used_from_percent = trend.first().expect("two readings").used_percent;
+    let used_until_percent = trend.last().expect("two readings").used_percent;
+    let quota_drops = trend.windows(2).filter(|pair| pair[1].used_percent < pair[0].used_percent).count();
+    let consumed_percent = (quota_drops == 0).then_some(used_until_percent - used_from_percent);
+    let hours = (end - start).num_milliseconds() as f64 / 3_600_000.0;
+    Ok(ProviderPeriod { plan_name: plan.into(), quota_from: from.to_rfc3339(),
+        quota_until: until.to_rfc3339(), endpoint_skew_seconds: skew, used_from_percent,
+        used_until_percent, consumed_percent, percent_per_hour: consumed_percent.map(|used| used / hours),
+        quota_drops, trend })
 }
 
 fn summarize(
@@ -564,14 +578,15 @@ mod tests {
         let mut history = History::default();
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
-        let records = [sample("2026-10-24T00:00:30Z"), sample("2026-10-24T01:00:00Z"), sample("2026-10-24T02:00:30Z")];
-        let result = compare_providers(&history, &codex, &claude, &records, &records).unwrap();
+        let result = compare_providers(&history, &codex, &claude).unwrap();
         assert_eq!(at(&result.start_at), at("2026-10-24T00:01:00Z"));
         assert_eq!(at(&result.end_at), at("2026-10-24T02:01:00Z"));
-        assert_eq!(result.codex.summary.sample_count, 2);
-        assert_eq!(result.claude.summary.sample_count, 2);
-        assert!((result.codex.summary.observed_percent - 4.0).abs() < 1e-9);
-        assert!((result.claude.summary.observed_percent - 2.0).abs() < 1e-9);
+        assert_eq!(result.codex.consumed_percent, Some(4.0));
+        assert_eq!(result.claude.consumed_percent, Some(2.0));
+        assert_eq!(result.codex.percent_per_hour, Some(2.0));
+        assert_eq!(result.claude.percent_per_hour, Some(1.0));
+        assert_eq!(result.codex.trend.len(), 3);
+        assert_eq!(result.claude.trend[0].used_percent, 20.0);
         assert_eq!(result.codex.endpoint_skew_seconds, 60);
         assert_eq!(result.claude.endpoint_skew_seconds, 0);
     }
@@ -585,7 +600,7 @@ mod tests {
         let mut history = History::default();
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
-        let result = compare_providers(&history, &codex, &claude, &[], &[]).unwrap();
+        let result = compare_providers(&history, &codex, &claude).unwrap();
         assert_eq!(at(&result.end_at), at("2026-10-24T02:01:00Z"));
         assert_eq!(result.claude.endpoint_skew_seconds, 0);
         assert_eq!(result.codex.endpoint_skew_seconds, 60);
@@ -603,7 +618,7 @@ mod tests {
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
         for (provider, time) in [("codex", "2026-10-24T02:06:00Z"), ("claude", "2026-10-24T02:07:00Z")] {
-            let result = compare_providers(&history, &codex, &claude, &[], &[]).unwrap();
+            let result = compare_providers(&history, &codex, &claude).unwrap();
             assert_eq!(at(&result.start_at), at("2026-10-24T02:01:00Z"));
             assert!(result.codex.endpoint_skew_seconds <= 180);
             assert!(result.claude.endpoint_skew_seconds <= 180);
@@ -612,7 +627,7 @@ mod tests {
             next.at = at(time);
             observations.push(next);
         }
-        let result = compare_providers(&history, &codex, &claude, &[], &[]).unwrap();
+        let result = compare_providers(&history, &codex, &claude).unwrap();
         assert_eq!(at(&result.end_at), at("2026-10-24T02:07:00Z"));
     }
 
@@ -625,41 +640,43 @@ mod tests {
         let mut history = History::default();
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
-        assert!(compare_providers(&history, &codex, &claude, &[], &[]).err().unwrap().contains("共同采样"));
+        assert!(compare_providers(&history, &codex, &claude).err().unwrap().contains("共同采样"));
     }
 
     #[test]
-    fn cross_provider_does_not_rank_quota_drops_or_missing_tokens() {
+    fn cross_provider_preserves_quota_drops_without_ranking_them() {
         let (snapshot, points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
             ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T00:01:00Z", 5.0), ("2026-10-24T00:02:00Z", 8.0)]);
         let mut history = History::default();
         history.observations.insert("codex".into(), points);
         let readings = weekly_readings(&history, &snapshot, "codex").unwrap();
-        let records = [sample("2026-10-24T00:01:30Z")];
-        let result = compare_period(&readings, readings.points[0].at, readings.points[2].at, &records, "codex", "Pro").unwrap();
-        assert_eq!(result.summary.quota_drops, 1);
-        assert_eq!(result.percent_per_million_tokens, None);
-        let empty = compare_period(&readings, readings.points[1].at, readings.points[2].at, &[], "codex", "Pro").unwrap();
-        assert_eq!(empty.summary.sample_count, 0);
-        assert_eq!(empty.percent_per_million_tokens, None);
+        let result = compare_period(&readings, readings.points[0].at, readings.points[2].at, "Pro").unwrap();
+        assert_eq!(result.quota_drops, 1);
+        assert_eq!(result.consumed_percent, None);
+        assert_eq!(result.percent_per_hour, None);
+        assert_eq!(result.trend[1].used_percent, 5.0);
+        let valid = compare_period(&readings, readings.points[1].at, readings.points[2].at, "Pro").unwrap();
+        assert_eq!(valid.consumed_percent, Some(3.0));
     }
 
     #[test]
-    fn empty_comparison_exposes_existing_records_outside_the_current_period() {
+    fn quota_comparison_requires_no_token_records_and_preserves_real_zero_usage() {
         let (snapshot, points) = comparison_fixture("claude", "2026-10-30T00:00:00Z", &[
             ("2026-10-24T02:00:00Z", 10.0), ("2026-10-24T03:00:00Z", 12.0)]);
         let mut history = History::default();
         history.observations.insert("claude".into(), points);
         let readings = weekly_readings(&history, &snapshot, "claude").unwrap();
-        let records = [sample("2026-10-24T01:00:00Z")];
-        let result = compare_period(&readings, readings.points[0].at, readings.points[1].at, &records, "claude", "Claude Pro").unwrap();
-        assert_eq!(result.recorded_sample_count, 1);
-        assert_eq!(at(result.last_recorded_at.as_deref().unwrap()), at(&records[0].timestamp));
-        assert_eq!(result.summary.sample_count, 0);
-        assert_eq!(result.percent_per_million_tokens, None);
-        let empty = compare_period(&readings, readings.points[0].at, readings.points[1].at, &[], "claude", "Claude Pro").unwrap();
-        assert_eq!(empty.recorded_sample_count, 0);
-        assert_eq!(empty.last_recorded_at, None);
+        let result = compare_period(&readings, readings.points[0].at, readings.points[1].at, "Claude Pro").unwrap();
+        assert_eq!(result.consumed_percent, Some(2.0));
+        assert_eq!(result.percent_per_hour, Some(2.0));
+        assert_eq!(result.used_from_percent, 10.0);
+        assert_eq!(result.used_until_percent, 12.0);
+        let (_, points) = comparison_fixture("claude", "2026-10-30T00:00:00Z", &[
+            ("2026-10-24T02:00:00Z", 10.0), ("2026-10-24T03:00:00Z", 10.0)]);
+        let readings = WeeklyReadings { window_id: "weekly".into(), points: points.iter().collect() };
+        let zero = compare_period(&readings, readings.points[0].at, readings.points[1].at, "Claude Pro").unwrap();
+        assert_eq!(zero.consumed_percent, Some(0.0));
+        assert_eq!(zero.percent_per_hour, Some(0.0));
     }
 
     #[test]
