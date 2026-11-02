@@ -63,7 +63,12 @@ async function subscriptionPlan($, authorization) {
 }
 
 function tick($, state) {
-  void synchronize($, state).catch((error) => $.ui.log(`CodexInfo 同步失败：${error instanceof Error ? error.message : String(error)}`));
+  void synchronize($, state)
+    .catch((error) => $.ui.log(`CodexInfo 同步失败：${error instanceof Error ? error.message : String(error)}`))
+    .finally(() => {
+      // 从查询完成后计时，避免定时器先于共享查询锁到期而跳过一轮。
+      if (!state.stopped) state.timer = $.clock.after(120_000, () => tick($, state));
+    });
 }
 
 export function register(on) {
@@ -72,7 +77,6 @@ export function register(on) {
     const result = await next(event);
     state.stopped = false;
     state.timer?.cancel();
-    state.timer = $.clock.every(120_000, () => tick($, state));
     tick($, state);
     return result;
   });

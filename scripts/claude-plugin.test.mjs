@@ -16,11 +16,12 @@ function harness() {
   const logs = [];
   let tick;
   let cancelled = false;
+  let scheduled = 0;
   register((event, handler) => handlers.set(event, handler));
   const api = {
     plugin: { root: "plugin" },
     session: { id: async () => "session:opaque/id", authorize: async () => ({ handle: "opaque-handle", kind: "bearer" }) },
-    clock: { every: (ms, callback) => { assert.equal(ms, 120_000); tick = callback; return { cancel: () => { cancelled = true; } }; } },
+    clock: { after: (ms, callback) => { assert.equal(ms, 120_000); scheduled++; tick = callback; return { cancel: () => { cancelled = true; } }; } },
     ui: { log: (message) => logs.push(message) },
     http: { fetch: async (url, init) => {
       requests.push({ url, init });
@@ -42,7 +43,8 @@ function harness() {
   return { api, handlers, exports, requests, logs,
     start: async () => { await handlers.get("session.start")(api, {}, async () => ({})); await setImmediate(); },
     tick: async () => { tick(); await setImmediate(); },
-    cancelled: () => cancelled
+    cancelled: () => cancelled,
+    scheduled: () => scheduled
   };
 }
 
@@ -174,9 +176,24 @@ test("ending session cancels polling and discards outstanding response", async (
   await h.handlers.get("session.end")(h.api, {}, async () => ({}));
   resolve({ ok: true, text: '{"five_hour":{"utilization":10,"resets_at":"2027-01-01T00:00:00Z"}}' });
   await setImmediate();
-  await h.tick();
-  assert.equal(h.cancelled(), true);
+  assert.equal(h.scheduled(), 0);
   assert.equal(h.exports.length, 0);
+});
+
+test("the next poll is scheduled after completion so a slow first claim cannot skip a cycle", async () => {
+  const h = harness();
+  let resolve;
+  h.api.http.fetch = () => new Promise((done) => { resolve = done; });
+  await h.start();
+  assert.equal(h.scheduled(), 0);
+  const fetch = async () => ({ ok: true, status: 200, text: '{"organization":{"organization_type":"claude_pro"}}' });
+  h.api.http.fetch = fetch;
+  resolve({ ok: true, text: '{"five_hour":{"utilization":42,"resets_at":null}}' });
+  await waitForExport(h.exports, 1);
+  await setImmediate();
+  assert.equal(h.scheduled(), 1);
+  await h.handlers.get("session.end")(h.api, {}, async () => ({}));
+  assert.equal(h.cancelled(), true);
 });
 
 test("clearing or resuming a conversation keeps the loaded bridge polling", async () => {
