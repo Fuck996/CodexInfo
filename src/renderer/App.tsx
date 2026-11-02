@@ -412,7 +412,7 @@ export function App() {
             {snapshot.usageWarning && <div className="data-warning" role="status">{snapshot.usageWarning}</div>}
 
             {provider === "claude" ? (
-              <div className="claude-source-note"><strong>Claude 账号额度</strong><p>最近同步：{formatFullDate(snapshot.updatedAt)}</p><p>在线 Code 桥接每 2 分钟查询账号额度，包含 Projects 等入口的消耗。关闭全部 Code 会话后同步暂停。</p><p>Token 明细仅统计已接入的 Code 请求。</p><p>银行重置余额：尚未提供。</p></div>
+              <div className="claude-source-note"><strong>Claude 账号额度</strong><p>最近同步：{formatFullDate(snapshot.updatedAt)}</p><p>后台自动查询，包含 Projects 和普通聊天；授权失效时自动续期，限流时按服务端要求等待重试。</p><p>Token 明细仅统计已接入的 Code 请求。</p><p>银行重置余额：尚未提供。</p></div>
             ) : canExpand ? (
               <ResetOverview
                 resets={sortedResets}

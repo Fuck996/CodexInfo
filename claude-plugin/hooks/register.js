@@ -16,7 +16,7 @@ async function synchronize($, state) {
       auth: authorization.handle,
       headers: { "anthropic-beta": "oauth-2025-04-20" }
     });
-    if (!response.ok) throw new QuotaReadError(`Claude 账号用量查询失败（HTTP ${response.status}）`, retryDelay(response));
+    if (!response.ok) throw new QuotaReadError(`Claude 账号用量查询失败（HTTP ${response.status}）`, response.status, retryDelay(response));
     let body;
     try { body = JSON.parse(response.text); }
     catch { throw new Error("Claude 账号用量响应不是有效 JSON"); }
@@ -33,6 +33,7 @@ async function synchronize($, state) {
     await exportReading($, {
       type: "syncFailure", updatedAt: new Date().toISOString(),
       message: error instanceof Error ? error.message : String(error),
+      statusCode: error instanceof QuotaReadError ? error.statusCode : null,
       retryAfterSecs: error instanceof QuotaReadError ? error.retryAfterSecs : 120
     });
   } finally { state.inFlight = false; }
@@ -102,8 +103,9 @@ export function register(on) {
 }
 
 class QuotaReadError extends Error {
-  constructor(message, retryAfterSecs) {
+  constructor(message, statusCode, retryAfterSecs) {
     super(message);
+    this.statusCode = statusCode;
     this.retryAfterSecs = retryAfterSecs;
   }
 }

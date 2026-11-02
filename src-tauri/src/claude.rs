@@ -41,6 +41,8 @@ struct SyncFailure {
     updated_at: DateTime<Utc>,
     message: String,
     retry_after_secs: u32,
+    #[serde(default)]
+    status_code: Option<u16>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,11 +159,16 @@ pub fn collect(directory: &Path, input: impl Read) -> Result<(), String> {
             let _lock = poll_lock(directory)?;
             write_json(&directory.join("sync-failure.json"), failure)?;
             let retry = failure.retry_after_secs.max(POLL_INTERVAL_SECS as u32);
+            let mut next_at = Utc::now() + chrono::Duration::seconds(i64::from(retry));
+            let lease_path = directory.join("poll-lease.json");
+            if lease_path.exists() {
+                let lease: PollLease = serde_json::from_slice(&fs::read(&lease_path).map_err(|error| error.to_string())?)
+                    .map_err(|error| format!("Claude 查询限频状态损坏: {error}"))?;
+                next_at = next_at.max(lease.next_at);
+            }
             return write_json(
-                &directory.join("poll-lease.json"),
-                &PollLease {
-                    next_at: Utc::now() + chrono::Duration::seconds(i64::from(retry)),
-                },
+                &lease_path,
+                &PollLease { next_at },
             );
         }
         Export::Reading(reading) => {
@@ -286,6 +293,19 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
             .is_none_or(|(reading, _)| failure.updated_at >= reading.updated_at)
         {
             let failed_at = failure.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S");
+            if failure.status_code == Some(429) || failure.message == "Claude 账号用量查询失败（HTTP 429）" {
+                let lease: PollLease = serde_json::from_slice(&fs::read(directory.join("poll-lease.json")).map_err(|error| error.to_string())?)
+                    .map_err(|error| format!("Claude 查询限频状态损坏: {error}"))?;
+                let retry = if lease.next_at > Utc::now() {
+                    format!("最早 {} 后自动重试", lease.next_at.with_timezone(&chrono::Local).format("%H:%M:%S"))
+                } else {
+                    "等待下一轮自动重试".into()
+                };
+                let last_reading = latest.as_ref().map(|(reading, _)|
+                    format!("；上次成功 {}", reading.updated_at.with_timezone(&chrono::Local).format("%H:%M:%S")))
+                    .unwrap_or_default();
+                return Err(format!("Claude 查询被限流（HTTP 429），{retry}{last_reading}。"));
+            }
             let status = if Utc::now().signed_duration_since(failure.updated_at).num_seconds() > MAX_READING_AGE_SECS {
                 "Claude 账号额度采集已中断"
             } else {
@@ -357,6 +377,14 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
         account_source: "claudeMod".into(),
         cached_at: None,
     })
+}
+
+pub(super) fn authorization_rejected_at(directory: &Path) -> Result<Option<DateTime<Utc>>, String> {
+    let path = directory.join("sync-failure.json");
+    if !path.exists() { return Ok(None); }
+    let failure: SyncFailure = serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
+        .map_err(|error| format!("Claude 同步状态损坏: {error}"))?;
+    Ok((failure.status_code == Some(401)).then_some(failure.updated_at))
 }
 
 pub fn token_samples(
@@ -504,9 +532,14 @@ fn run_cli(cli: &Path, args: &[&str]) -> Result<(), String> {
 pub(super) fn cli_output(cli: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut command = Command::new(cli);
     command.args(args);
+    command_output(command)
+}
+
+pub(super) fn command_output(mut command: Command) -> Result<std::process::Output, String> {
     #[cfg(target_os = "windows")]
     command.creation_flags(0x08000000);
     let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -757,6 +790,23 @@ mod tests {
         collect(&directory, failure.to_string().as_bytes()).unwrap();
         assert!(!claim_poll(&directory, now + chrono::Duration::seconds(300)).unwrap());
         assert!(claim_poll(&directory, now + chrono::Duration::seconds(701)).unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_later_failure_cannot_shorten_server_cooldown_and_rate_limit_shows_retry_time() {
+        let directory = test_directory("server-cooldown");
+        let now = Utc::now();
+        account_reading(&directory, now - chrono::Duration::minutes(30));
+        collect(&directory, json!({"type":"syncFailure","updatedAt":now,"message":"Claude 账号用量查询失败（HTTP 429）",
+            "statusCode":429,"retryAfterSecs":3600}).to_string().as_bytes()).unwrap();
+        let first: PollLease = serde_json::from_slice(&fs::read(directory.join("poll-lease.json")).unwrap()).unwrap();
+        assert!(read_snapshot(&directory).unwrap_err().contains("最早"));
+        collect(&directory, json!({"type":"syncFailure","updatedAt":now,"message":"HTTP 401",
+            "statusCode":401,"retryAfterSecs":120}).to_string().as_bytes()).unwrap();
+        let second: PollLease = serde_json::from_slice(&fs::read(directory.join("poll-lease.json")).unwrap()).unwrap();
+        assert_eq!(first.next_at, second.next_at);
+        assert_eq!(authorization_rejected_at(&directory).unwrap(), Some(now));
         fs::remove_dir_all(directory).unwrap();
     }
 }

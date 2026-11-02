@@ -20,10 +20,19 @@ use windows::Win32::{
 pub(super) struct Host {
     process: Option<HostProcess>,
     retry: Option<(Instant, String)>,
+    renewed_after: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Host {
     pub(super) fn ensure_running(&mut self, root: &Path) -> Result<(), String> {
+        if let Some(rejected_at) = claude::authorization_rejected_at(&root.join("claude-readings"))? {
+            if self.renewed_after.is_none_or(|previous| rejected_at > previous) {
+                self.renewed_after = Some(rejected_at);
+                diagnostics::record(&format!("claude_host authorization_rejected at={rejected_at}; renewing through official initialization"));
+                self.shutdown()?;
+                self.retry = None;
+            }
+        }
         if let Some(process) = &mut self.process {
             if let Some(status) = process.child.try_wait().map_err(|error| error.to_string())? {
                 let output = self.process.take().expect("host process present").stop()?;
@@ -50,6 +59,15 @@ impl Host {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let plugin = claude::prepare_plugin(root, &executable)?;
         let cli = claude::find_cli()?;
+        // Mods 授权只读取现有凭据；官方初始化负责续期，之后由新宿主读取新授权。
+        let mut initialization = Command::new(&cli);
+        initialization.current_dir(root.join("claude-bridge"))
+            .args(["--init-only", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"]);
+        apply_network_settings(&mut initialization)?;
+        let initialized = claude::command_output(initialization)?;
+        if !initialized.status.success() {
+            return Err(format!("Claude 官方授权初始化失败：{}", String::from_utf8_lossy(&initialized.stderr).trim()));
+        }
         let output = claude::cli_output(&cli, &["auth", "status"])?;
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -217,14 +235,33 @@ mod tests {
     }
 
     #[test]
+    fn one_authorization_rejection_stops_the_owned_host_once_and_keeps_retry_budget() {
+        let root = std::env::temp_dir().join(format!("codexinfo-host-auth-{}", std::process::id()));
+        let readings = root.join("claude-readings");
+        fs::create_dir_all(&readings).unwrap();
+        let rejected_at = chrono::Utc::now();
+        claude::collect(&readings, serde_json::json!({"type":"syncFailure","updatedAt":rejected_at,
+            "message":"HTTP 401","statusCode":401,"retryAfterSecs":3600}).to_string().as_bytes()).unwrap();
+        let lease = fs::read(readings.join("poll-lease.json")).unwrap();
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoLogo", "-NoProfile", "-Command", "[Console]::In.ReadToEnd()"]);
+        let mut host = Host { process: Some(HostProcess::spawn(command).unwrap()), retry: None, renewed_after: None };
+        assert!(host.ensure_running(&root).is_err());
+        assert!(host.process.is_none());
+        assert_eq!(host.renewed_after, Some(rejected_at));
+        let retry = host.retry.as_ref().unwrap().0;
+        assert!(host.ensure_running(&root).is_err());
+        assert_eq!(host.retry.as_ref().unwrap().0, retry);
+        assert_eq!(fs::read(readings.join("poll-lease.json")).unwrap(), lease);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn dropping_host_cleans_up_only_its_own_process_tree() {
         let path = std::env::temp_dir().join(format!("codexinfo-host-child-{}.txt", std::process::id()));
-        let script = format!(
-            "$p = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('{}', [string]$p.Id); [Console]::In.ReadToEnd()",
-            path.to_string_lossy().replace('\'', "''")
-        );
-        let mut command = Command::new("powershell.exe");
-        command.args(["-NoLogo", "-NoProfile", "-Command", &script]);
+        let mut command = Command::new("node.exe");
+        command.args(["-e", "const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{windowsHide:true,stdio:'ignore'});require('node:fs').writeFileSync(process.argv[1],String(child.pid));process.stdin.resume();"]);
+        command.arg(&path);
         let process = HostProcess::spawn(command).unwrap();
         let started = Instant::now();
         while !path.exists() && started.elapsed() < Duration::from_secs(10) {

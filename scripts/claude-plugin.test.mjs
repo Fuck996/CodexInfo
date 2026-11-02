@@ -113,7 +113,18 @@ test("rate limiting is exported with server retry delay and no stale snapshot", 
   await h.start();
   assert.equal(h.exports[0].reading.type, "syncFailure");
   assert.equal(h.exports[0].reading.retryAfterSecs, 700);
+  assert.equal(h.exports[0].reading.statusCode, 429);
   assert.match(h.exports[0].reading.message, /HTTP 429/);
+});
+
+test("authorization rejection is exported distinctly for official host renewal", async () => {
+  const h = harness();
+  h.api.http.fetch = async () => ({ ok: false, status: 401, headers: {} });
+  await h.start();
+  await waitForExport(h.exports, 1);
+  assert.equal(h.exports[0].reading.statusCode, 401);
+  assert.equal(h.exports[0].reading.retryAfterSecs, 120);
+  assert.equal(h.requests.length, 0);
 });
 
 test("nullable quota fields preserve independent readings without inventing usage or reset times", async () => {

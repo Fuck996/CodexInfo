@@ -58,6 +58,8 @@ CodexInfo 优先读取本机 Codex 的真实数据：
 
 官方资料：[Mods](https://code.claude.com/docs/en/plugins/mods/overview)、[Mods API](https://code.claude.com/docs/en/plugins/mods/reference)、[银行重置语义](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset)。
 
+授权初始化使用官方 `--init-only`，只运行初始化，不启动对话。查询收到明确的 HTTP 401 后，组件结束自己的查询宿主，通过该入口完成官方授权续期，再让新宿主读取新授权；同一失败记录只处理一次，不重启用户的 Code 会话。HTTP 429 单独显示服务端等待期限，旧错误不会再被笼统显示为离线；后续失败不能缩短已经生效的 `Retry-After`。组件不清空限频状态、不提前试探额度接口、不读取或保存订阅凭据。
+
 ### 周期与成本口径
 
 - 周期从平台返回的重置时间和窗口长度确定，不再用自然周 / 自然月代替额度周期。上周期只使用实际观测过的窗口；没有历史时显示缺口。
