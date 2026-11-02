@@ -285,7 +285,13 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
             .as_ref()
             .is_none_or(|(reading, _)| failure.updated_at >= reading.updated_at)
         {
-            return Err(format!("Claude 账号用量同步失败：{}", failure.message));
+            let failed_at = failure.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S");
+            let status = if Utc::now().signed_duration_since(failure.updated_at).num_seconds() > MAX_READING_AGE_SECS {
+                "Claude 账号额度采集已中断"
+            } else {
+                "Claude 账号用量同步失败"
+            };
+            return Err(format!("{status}（最后失败：{failed_at}）：{}", failure.message));
         }
     }
     let (reading, path) = latest.ok_or_else(|| {
@@ -294,7 +300,7 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
     })?;
     let now = Utc::now();
     if now.signed_duration_since(reading.updated_at).num_seconds() > MAX_READING_AGE_SECS {
-        return Err(format!("Claude 账号用量超过 5 分钟未更新（最近读数：{}）。请确认 Code 桥接在线；Projects 聊天不会加载 Code 插件。", reading.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S")));
+        return Err(format!("Claude 账号用量超过 5 分钟未更新（最近读数：{}）。后台额度采集尚未恢复，当前不能比较。", reading.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S")));
     }
     let mut unavailable_windows = Vec::new();
     let windows = reading
@@ -416,6 +422,37 @@ pub fn token_samples(
 }
 
 pub fn install(root: &Path, executable: &Path) -> Result<String, String> {
+    let plugin = prepare_plugin(root, executable)?;
+    let marketplace = root.join("claude-bridge");
+    let cli = find_cli()?;
+    run_cli(&cli, &["plugin", "validate", &plugin.to_string_lossy()])?;
+    run_cli(
+        &cli,
+        &[
+            "plugin",
+            "marketplace",
+            "add",
+            &marketplace.to_string_lossy(),
+        ],
+    )?;
+    run_cli(
+        &cli,
+        &[
+            "plugin",
+            "install",
+            "codexinfo-usage@codexinfo-local",
+            "--scope",
+            "user",
+        ],
+    )?;
+    run_cli(
+        &cli,
+        &["plugin", "update", "codexinfo-usage@codexinfo-local"],
+    )?;
+    Ok("Claude 账号用量已接入。组件会自动启动后台查询宿主；请先完成 Claude Code 官方登录，之后使用 Projects 或普通聊天也能同步账号额度。已有 Code 会话可执行 /reload-plugins 继续采集该会话的 Token。".into())
+}
+
+pub(super) fn prepare_plugin(root: &Path, executable: &Path) -> Result<PathBuf, String> {
     let marketplace = root.join("claude-bridge");
     let plugin = marketplace.join("claude-plugin");
     fs::create_dir_all(plugin.join(".claude-plugin")).map_err(|error| error.to_string())?;
@@ -449,35 +486,22 @@ pub fn install(root: &Path, executable: &Path) -> Result<String, String> {
         manifest.to_string(),
     )
     .map_err(|error| error.to_string())?;
-    let cli = find_cli()?;
-    run_cli(&cli, &["plugin", "validate", &plugin.to_string_lossy()])?;
-    run_cli(
-        &cli,
-        &[
-            "plugin",
-            "marketplace",
-            "add",
-            &marketplace.to_string_lossy(),
-        ],
-    )?;
-    run_cli(
-        &cli,
-        &[
-            "plugin",
-            "install",
-            "codexinfo-usage@codexinfo-local",
-            "--scope",
-            "user",
-        ],
-    )?;
-    run_cli(
-        &cli,
-        &["plugin", "update", "codexinfo-usage@codexinfo-local"],
-    )?;
-    Ok("Claude 账号用量桥接已更新。在一个 Code 会话中执行 /reload-plugins 并保持在线，即可自动同步 Projects 等入口的账号额度，不需要发送模型消息。".into())
+    Ok(plugin)
 }
 
 fn run_cli(cli: &Path, args: &[&str]) -> Result<(), String> {
+    let output = cli_output(cli, args)?;
+    if !output.status.success() {
+        return Err(format!(
+            "Claude Code 插件安装失败: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn cli_output(cli: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut command = Command::new(cli);
     command.args(args);
     #[cfg(target_os = "windows")]
@@ -515,7 +539,7 @@ fn run_cli(cli: &Path, args: &[&str]) -> Result<(), String> {
                 let _ = child.wait();
                 break Err(match pending {
                     Err(error) => error.to_string(),
-                    _ => "Claude Code 插件安装超时，已停止安装进程".into(),
+                    _ => "Claude Code 命令超时，已停止子进程".into(),
                 });
             }
         }
@@ -528,17 +552,10 @@ fn run_cli(cli: &Path, args: &[&str]) -> Result<(), String> {
         .join()
         .map_err(|_| "读取安装错误的线程失败".to_string())?
         .map_err(|error| error.to_string())?;
-    if !status?.success() {
-        return Err(format!(
-            "Claude Code 插件安装失败: {}{}",
-            String::from_utf8_lossy(&stdout),
-            String::from_utf8_lossy(&stderr)
-        ));
-    }
-    Ok(())
+    Ok(std::process::Output { status: status?, stdout, stderr })
 }
 
-fn find_cli() -> Result<PathBuf, String> {
+pub(super) fn find_cli() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
@@ -701,6 +718,20 @@ mod tests {
         assert!(read_snapshot(&directory).unwrap_err().contains("HTTP 429"));
         account_reading(&directory, Utc::now() + chrono::Duration::seconds(1));
         assert_eq!(read_snapshot(&directory).unwrap().windows[0].used, 42.5);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn old_network_failures_are_dated_as_interrupted_collection() {
+        let directory = test_directory("old-network-failure");
+        account_reading(&directory, Utc::now() - chrono::Duration::days(4));
+        let failure = json!({"type":"syncFailure","updatedAt":Utc::now() - chrono::Duration::days(3),
+            "message":"ECONNREFUSED", "retryAfterSecs":120});
+        collect(&directory, failure.to_string().as_bytes()).unwrap();
+        let error = read_snapshot(&directory).unwrap_err();
+        assert!(error.contains("采集已中断"));
+        assert!(error.contains("最后失败："));
+        assert!(error.contains("ECONNREFUSED"));
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -1,5 +1,6 @@
 mod diagnostics;
 mod claude;
+mod claude_host;
 mod analytics;
 mod sampling;
 mod monitors;
@@ -73,6 +74,7 @@ static DOCK_Z_ORDER_EVENTS: OnceLock<mpsc::Sender<()>> = OnceLock::new();
 
 #[derive(Clone)]
 struct AppState {
+    claude_host: Arc<Mutex<claude_host::Host>>,
     claude_usage_cache: Arc<Mutex<HashMap<PathBuf, CachedSessionUsage>>>,
     analytics_history: Arc<Mutex<analytics::History>>,
     settings_open: Arc<AtomicBool>,
@@ -2116,8 +2118,16 @@ async fn get_usage_snapshot(app: AppHandle, provider: UsageProvider) -> Result<U
 fn load_usage_snapshot(app: &AppHandle, provider: UsageProvider, include_tokens: bool) -> Result<UsageSnapshot, String> {
     if provider == UsageProvider::Claude {
         let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
-        let mut snapshot = claude::read_snapshot(&root.join("claude-readings"))?;
         let state = app.state::<AppState>();
+        let host = state.claude_host.lock().map_err(|error| error.to_string())?.ensure_running(&root);
+        let mut snapshot = claude::read_snapshot(&root.join("claude-readings"))
+            .map_err(|error| match &host { Ok(()) => error, Err(host_error) => format!("{host_error}\n{error}") })?;
+        if let Err(error) = host {
+            snapshot.usage_warning = Some(match snapshot.usage_warning.take() {
+                Some(warning) => format!("{warning}；后台查询异常：{error}"),
+                None => format!("后台查询异常：{error}"),
+            });
+        }
         if include_tokens {
             let mut token_cache = state.claude_usage_cache.lock().map_err(|error| error.to_string())?;
             let samples = claude::token_samples(&root.join("claude-readings"), &mut token_cache)?;
@@ -2839,6 +2849,7 @@ pub fn run() {
         None => eprintln!("无法确定诊断日志目录"),
     }
     let state = AppState {
+        claude_host: Arc::new(Mutex::new(claude_host::Host::default())),
         claude_usage_cache: Arc::new(Mutex::new(HashMap::new())),
         analytics_history: Arc::new(Mutex::new(analytics::History::default())),
         settings_open: Arc::new(AtomicBool::new(false)),
@@ -2985,6 +2996,13 @@ pub fn run() {
                     if let Err(error) = sampler.shutdown() {
                         diagnostics::record(&format!("usage_sampler shutdown_failed error={error}"));
                     }
+                }
+                let state = app.state::<AppState>();
+                match state.claude_host.lock() {
+                    Ok(mut host) => {
+                        if let Err(error) = host.shutdown() { diagnostics::record(&format!("claude_host shutdown_failed error={error}")); }
+                    }
+                    Err(error) => diagnostics::record(&format!("claude_host shutdown_failed error={error}")),
                 }
                 diagnostics::event_loop_exit();
             }

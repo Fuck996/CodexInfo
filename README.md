@@ -50,11 +50,11 @@ CodexInfo 优先读取本机 Codex 的真实数据：
 
 1. 在 Claude 桌面版打开 Code 页，或安装终端版 Claude Code。桌面版内置 Claude Code 需至少 v2.1.286，终端版需至少 v2.1.287。
 2. 启动新版本 CodexInfo，打开“显示设置”，点击“接入 Claude Code”。组件通过 Claude 官方 CLI 安装本地 `codexinfo-usage` 插件；支持普通桌面版及 Microsoft Store 版的内置 CLI，终端版需可从 PATH 找到 `claude.exe`。
-3. 在已打开的 Code 会话执行 `/reload-plugins` 并保持会话在线。插件启动时立即查询账号额度，此后每 2 分钟查询一次；Projects、网页和桌面聊天的消耗都属于同一账号额度。组件每 5 秒读取同步结果，不调用推理接口查询额度。Code 请求的 Token 及模型仍通过 `turn.step` 采集。
+3. 通过官方 `claude auth login` 完成一次订阅账号登录。Desktop 与 CLI 的登录独立；授权码只填写在官方登录终端内。组件随后自动启动隐藏的官方 CLI 宿主，保持流式输入管道打开但不提交消息，插件启动后每 2 分钟查询账号额度。无需打开 Code 页或保持组件前台；Projects、网页和桌面聊天的消耗都属于同一账号额度。已有 Code 会话执行 `/reload-plugins` 后，其请求 Token 及模型仍通过 `turn.step` 采集。
 
 插件通过官方 Mods 的 `session.authorize` 获取不透明授权句柄，再由 Claude 宿主请求内置 `/api/oauth/usage` 账号额度接口，令牌留在 Claude 内，不会导出给插件或组件。只导出计数、时间、会话 / 请求标识和模型，不导出聊天文本及工具参数。多会话使用本地文件锁共享查询间隔，429 按服务端 `Retry-After` 等待；账号额度覆盖同一文件，请求 Token 按标识去重。移动免安装程序后应重新接入，以更新插件中的程序路径。
 
-这条同步需要至少一个加载插件的 Code 会话在线，全部关闭后会暂停；不必向模型发送消息。账号查询失败会明确显示原因，不回退到旧会话快照；超过 5 分钟未更新会提示桥接离线。到期窗口不继续显示旧百分比，缺失窗口不补零。账号额度接口是 Claude 内置查询链路，尚无稳定的公开 API 契约，若字段或权限变化会明确报错。银行重置余额仍显示“尚未提供”；Codex 原有银行重置余额与到期详情保留。组件不执行银行重置。
+后台宿主使用官方 `--print --input-format stream-json` 及 Mods，只加载本组件的额度插件，不发现项目配置或连接 MCP，不发模型请求。它沿用 CLI 的官方登录和已有网络环境配置，不读取或转存订阅凭据。宿主异常退出后最多每 2 分钟重试；组件退出时关闭输入管道并清理自有进程树，Windows Job Object 也会在组件异常退出时清理宿主。已有 Desktop 桥接和后台宿主共用原有账号读数与查询锁，不重复扣查询预算。账号查询失败会显示原因和时间，不回退到旧会话快照；超过 5 分钟未更新会提示采集中断。到期窗口不继续显示旧百分比，缺失窗口不补零。账号额度接口是 Claude 内置查询链路，尚无稳定的公开 API 契约，若字段或权限变化会明确报错。银行重置余额仍显示“尚未提供”；Codex 原有银行重置余额与到期详情保留。组件不执行银行重置。
 
 官方资料：[Mods](https://code.claude.com/docs/en/plugins/mods/overview)、[Mods API](https://code.claude.com/docs/en/plugins/mods/reference)、[银行重置语义](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset)。
 

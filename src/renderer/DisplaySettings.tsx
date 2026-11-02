@@ -86,7 +86,7 @@ export function DisplaySettings({ settings, onChange, onClose }: {
         </select>
         <div className="claude-connection">
           <strong>Claude 账号用量桥接</strong>
-          <p>通过在线 Code 会话每 2 分钟同步账号额度，包含 Projects 的消耗。更新后执行 /reload-plugins；只导出用量与重置时间，授权由 Claude 持有。</p>
+          <p>完成 Claude Code 官方登录后，组件会自动在后台每 2 分钟查询账号额度，包含 Projects 和普通聊天的消耗。无需打开 Code 页，授权始终由 Claude 持有。</p>
           <button className="connect-button" disabled={connecting} onClick={() => void connect()}>{connecting ? "正在接入…" : "接入 Claude Code"}</button>
         </div>
         {saving && <p role="status">正在保存…</p>}

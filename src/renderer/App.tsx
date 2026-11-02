@@ -381,7 +381,7 @@ export function App() {
             <strong className="brand-title"><span>{providerName.toUpperCase()}</span><em>用量核心</em></strong>
           </div>
           <div className="plan-meta">
-            <span className="plan-badge" title={snapshot?.planError ?? snapshot?.planName}>{provider === "claude" ? snapshot?.planName ?? "读取套餐中" : compactPlanName(snapshot?.planName)}</span>
+            <span className="plan-badge" title={snapshot?.planError ?? snapshot?.planName}>{provider === "claude" ? snapshot?.planName ?? (loading ? "读取套餐中" : "套餐未同步") : compactPlanName(snapshot?.planName)}</span>
           </div>
         </div>
 
