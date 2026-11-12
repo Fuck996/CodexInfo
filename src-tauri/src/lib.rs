@@ -234,6 +234,12 @@ impl UsageProvider {
 #[serde(rename_all = "camelCase")]
 enum UsageMode { #[default] Codex, Claude, Rotate }
 
+impl UsageMode {
+    fn for_monitoring(self, enabled: bool) -> Self {
+        if enabled { self } else { Self::Codex }
+    }
+}
+
 struct UsageDisplay {
     mode: UsageMode,
     provider: UsageProvider,
@@ -244,6 +250,38 @@ struct UsageDisplay {
 impl Default for UsageDisplay {
     fn default() -> Self {
         Self { mode: UsageMode::Codex, provider: UsageProvider::Codex, interval_secs: 10, switched_at: Instant::now() }
+    }
+}
+
+impl UsageDisplay {
+    fn select(&mut self, mode: UsageMode) {
+        self.mode = mode;
+        self.provider = match mode {
+            UsageMode::Codex => UsageProvider::Codex,
+            UsageMode::Claude => UsageProvider::Claude,
+            UsageMode::Rotate => self.provider,
+        };
+        self.switched_at = Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod usage_display_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_monitoring_uses_codex_even_with_a_saved_claude_or_rotation_mode() {
+        for mode in [UsageMode::Claude, UsageMode::Rotate] {
+            let mut display = UsageDisplay::default();
+            display.select(UsageMode::Claude);
+            display.select(mode.for_monitoring(true));
+            assert_eq!(display.mode, mode);
+            assert_eq!(display.provider, UsageProvider::Claude);
+
+            display.select(mode.for_monitoring(false));
+            assert_eq!(display.mode, UsageMode::Codex);
+            assert_eq!(display.provider, UsageProvider::Codex);
+        }
     }
 }
 
@@ -302,6 +340,10 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir.join("settings.json"))
+}
+
+fn claude_readings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings"))
 }
 
 fn read_stored_settings(app: &AppHandle) -> Result<StoredSettings, String> {
@@ -2093,7 +2135,7 @@ fn read_explicit_snapshot(app: &AppHandle) -> Option<DiscoveredSnapshot> {
 #[tauri::command]
 fn get_cached_usage_snapshot(app: AppHandle, provider: UsageProvider) -> Result<Option<UsageSnapshot>, String> {
     if provider == UsageProvider::Claude {
-        let readings = app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings");
+        let readings = claude_readings_path(&app)?;
         if !claude::monitoring_enabled(&readings)? { return Ok(None); }
         return claude::read_snapshot(&readings).map(Some);
     }
@@ -2217,12 +2259,16 @@ fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
         .map_err(|error| error.to_string())?;
     let stored = read_stored_settings(&app)?;
     let dock_enabled = stored.dock_enabled || stored.taskbar_usage_enabled;
-    let readings = app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings");
+    let (usage_mode, active_provider, rotation_interval_secs, claude_monitoring_enabled) = {
+        let state = app.state::<AppState>();
+        let display = state.usage_display.lock().map_err(|error| error.to_string())?;
+        (display.mode, display.provider, display.interval_secs, claude::monitoring_enabled(&claude_readings_path(&app)?)?)
+    };
     Ok(AppSettings {
-        usage_mode: stored.usage_mode,
-        active_provider: app.state::<AppState>().usage_display.lock().map_err(|error| error.to_string())?.provider,
-        claude_monitoring_enabled: claude::monitoring_enabled(&readings)?,
-        rotation_interval_secs: stored.rotation_interval_secs,
+        usage_mode,
+        active_provider,
+        claude_monitoring_enabled,
+        rotation_interval_secs,
         selected_monitor: stored.selected_monitor,
         launch_at_startup,
         main_visible: stored.main_visible,
@@ -2243,21 +2289,19 @@ fn set_usage_mode(app: AppHandle, mode: UsageMode, interval_secs: u64) -> Result
     if ![5, 10, 30, 60].contains(&interval_secs) {
         return Err("轮播间隔必须为 5、10、30 或 60 秒".into());
     }
-    let mut stored = read_stored_settings(&app)?;
-    stored.usage_mode = mode;
-    stored.rotation_interval_secs = interval_secs;
-    write_stored_settings(&app, &stored)?;
     let state = app.state::<AppState>();
     {
         let mut display = state.usage_display.lock().map_err(|error| error.to_string())?;
-        display.mode = mode;
+        let enabled = claude::monitoring_enabled(&claude_readings_path(&app)?)?;
+        if mode != mode.for_monitoring(enabled) {
+            return Err(claude::MONITORING_DISABLED.into());
+        }
+        let mut stored = read_stored_settings(&app)?;
+        stored.usage_mode = mode;
+        stored.rotation_interval_secs = interval_secs;
+        write_stored_settings(&app, &stored)?;
         display.interval_secs = interval_secs;
-        display.switched_at = Instant::now();
-        display.provider = match mode {
-            UsageMode::Codex => UsageProvider::Codex,
-            UsageMode::Claude => UsageProvider::Claude,
-            UsageMode::Rotate => display.provider,
-        };
+        display.select(mode);
     }
     notify_usage_display(&app, &state);
     get_settings(app)
@@ -2298,16 +2342,19 @@ async fn install_claude_bridge(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 async fn set_claude_monitoring_enabled(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let readings = app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings");
-        claude::set_monitoring_enabled(&readings, enabled)?;
+        let readings = claude_readings_path(&app)?;
         let state = app.state::<AppState>();
-        let stopped = if !enabled {
-            state.claude_host.lock().map_err(|error| error.to_string())?.shutdown()
-        } else {
-            Ok(())
-        };
+        {
+            let mut display = state.usage_display.lock().map_err(|error| error.to_string())?;
+            let mode = if enabled { read_stored_settings(&app)?.usage_mode } else { UsageMode::Codex };
+            claude::set_monitoring_enabled(&readings, enabled)?;
+            display.select(mode);
+        }
         notify_usage_display(&app, &state);
-        stopped?;
+        if !enabled {
+            let mut host = state.claude_host.lock().map_err(|error| error.to_string())?;
+            if !claude::monitoring_enabled(&readings)? { host.shutdown()?; }
+        }
         get_settings(app)
     }).await.map_err(|error| error.to_string())?
 }
@@ -2678,13 +2725,18 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     )?;
     let startup_item = CheckMenuItem::with_id(app, "startup", "开机启动", true, startup_checked, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let sources = Submenu::with_id(app, "sources", "显示用量", true)?;
-    for (id, text, mode) in [("source_codex", "Codex", UsageMode::Codex), ("source_claude", "Claude", UsageMode::Claude), ("source_rotate", "自动轮播", UsageMode::Rotate)] {
-        sources.append(&CheckMenuItem::with_id(app, id, text, true, stored_settings.usage_mode == mode, None::<&str>)?)?;
-    }
-    let intervals = Submenu::with_id(app, "intervals", "轮播间隔", true)?;
-    for seconds in [5, 10, 30, 60] {
-        intervals.append(&CheckMenuItem::with_id(app, format!("interval_{seconds}"), format!("每 {seconds} 秒"), true, stored_settings.rotation_interval_secs == seconds, None::<&str>)?)?;
+    let menu = Menu::new(app)?;
+    let claude_enabled = claude_readings_path(app).and_then(|path| claude::monitoring_enabled(&path)).unwrap_or(false);
+    if claude_enabled {
+        let sources = Submenu::with_id(app, "sources", "显示用量", true)?;
+        for (id, text, mode) in [("source_codex", "Codex", UsageMode::Codex), ("source_claude", "Claude", UsageMode::Claude), ("source_rotate", "自动轮播", UsageMode::Rotate)] {
+            sources.append(&CheckMenuItem::with_id(app, id, text, true, stored_settings.usage_mode == mode, None::<&str>)?)?;
+        }
+        let intervals = Submenu::with_id(app, "intervals", "轮播间隔", true)?;
+        for seconds in [5, 10, 30, 60] {
+            intervals.append(&CheckMenuItem::with_id(app, format!("interval_{seconds}"), format!("每 {seconds} 秒"), true, stored_settings.rotation_interval_secs == seconds, None::<&str>)?)?;
+        }
+        menu.append_items(&[&sources, &intervals])?;
     }
     let monitors_menu = Submenu::with_id(app, "monitors", "显示在哪个屏幕", true)?;
     monitors_menu.append(&CheckMenuItem::with_id(app, "monitor_primary", "跟随主屏", true, stored_settings.selected_monitor.is_none(), None::<&str>)?)?;
@@ -2694,11 +2746,8 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                 stored_settings.selected_monitor.as_ref() == Some(&monitor.id), None::<&str>)?)?;
         }
     }
-    Menu::with_items(
-        app,
+    menu.append_items(
         &[
-            &sources,
-            &intervals,
             &monitors_menu,
             &visible_item,
             &top_item,
@@ -2709,7 +2758,8 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &startup_item,
             &quit_item,
         ],
-    )
+    )?;
+    Ok(menu)
 }
 
 fn refresh_tray_menu(app: &AppHandle) {
@@ -2942,9 +2992,9 @@ pub fn run() {
             let stored_settings = read_stored_settings(app.handle()).unwrap_or_default();
             {
                 let mut display = state.usage_display.lock().map_err(|error| error.to_string())?;
-                display.mode = stored_settings.usage_mode;
+                let enabled = claude::monitoring_enabled(&claude_readings_path(app.handle())?)?;
                 display.interval_secs = stored_settings.rotation_interval_secs;
-                display.provider = if stored_settings.usage_mode == UsageMode::Claude { UsageProvider::Claude } else { UsageProvider::Codex };
+                display.select(stored_settings.usage_mode.for_monitoring(enabled));
             }
             *state.selected_monitor.lock().map_err(|error| error.to_string())? = stored_settings.selected_monitor;
             let dock_enabled = stored_settings.dock_enabled || stored_settings.taskbar_usage_enabled;

@@ -79,11 +79,13 @@ export function DisplaySettings({ settings, onChange, onClose }: {
           {monitors.map((monitor) => <option key={monitor.id} value={monitor.id}>{monitor.label}</option>)}
         </select>
         <p>悬浮条和展开面板一起移动。断开时暂用主屏，重连后恢复。</p>
-        <label htmlFor="rotation-interval">自动轮播间隔</label>
-        <select id="rotation-interval" value={settings.rotationIntervalSecs} disabled={saving}
-          onChange={(event) => { const interval = Number(event.target.value); void save(() => desktopApi.setUsageMode(settings.usageMode, interval)); }}>
-          {[5, 10, 30, 60].map((seconds) => <option key={seconds} value={seconds}>每 {seconds} 秒</option>)}
-        </select>
+        {settings.claudeMonitoringEnabled && <>
+          <label htmlFor="rotation-interval">自动轮播间隔</label>
+          <select id="rotation-interval" value={settings.rotationIntervalSecs} disabled={saving}
+            onChange={(event) => { const interval = Number(event.target.value); void save(() => desktopApi.setUsageMode(settings.usageMode, interval)); }}>
+            {[5, 10, 30, 60].map((seconds) => <option key={seconds} value={seconds}>每 {seconds} 秒</option>)}
+          </select>
+        </>}
         <div className="claude-connection">
           <label htmlFor="claude-monitoring">启用 Claude 监控</label>
           <select id="claude-monitoring" value={settings.claudeMonitoringEnabled ? "on" : "off"} disabled={saving || connecting}

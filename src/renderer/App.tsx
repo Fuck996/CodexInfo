@@ -198,7 +198,7 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
-  const [snapshot, setSnapshot] = useState<UsageSnapshot | null>(null);
+  const [reading, setSnapshot] = useState<UsageSnapshot | null>(null);
   const [expanded, setExpanded] = useState(true);
   const [analyticsView, setAnalyticsView] = useState<"cycle" | "providers" | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -241,9 +241,10 @@ export function App() {
     };
   }, []);
 
-  const provider = settings?.activeProvider ?? "codex";
+  const claudeMonitoringEnabled = settings?.claudeMonitoringEnabled ?? false;
+  const provider = claudeMonitoringEnabled ? settings?.activeProvider ?? "codex" : "codex";
   const providerName = provider === "claude" ? "Claude" : "Codex";
-  const monitoringDisabled = provider === "claude" && settings?.claudeMonitoringEnabled === false;
+  const snapshot = reading?.provider === provider ? reading : null;
 
   useEffect(() => {
     if (!settings) return;
@@ -253,11 +254,6 @@ export function App() {
     setLoading(true);
     setError("");
     setCodexConnected(false);
-    if (monitoringDisabled) {
-      setError("Claude 监控已关闭，可在显示设置中开启。");
-      setLoading(false);
-      return;
-    }
 
     function applySnapshot(usage: UsageSnapshot, connected?: boolean) {
       setSnapshot(usage);
@@ -308,7 +304,7 @@ export function App() {
       mounted = false;
       window.clearInterval(timer);
     };
-  }, [provider, settings !== null, monitoringDisabled]);
+  }, [provider, settings !== null]);
 
   const windows = useMemo(() => sortWindows(snapshot?.windows ?? []), [snapshot?.windows]);
   const sortedResets = useMemo(
@@ -387,20 +383,20 @@ export function App() {
             <strong className="brand-title"><span>{providerName.toUpperCase()}</span><em>用量核心</em></strong>
           </div>
           <div className="plan-meta">
-            <span className="plan-badge" title={snapshot?.planError ?? snapshot?.planName}>{provider === "claude" ? snapshot?.planName ?? (monitoringDisabled ? "监控已关闭" : loading ? "读取套餐中" : "套餐未同步") : compactPlanName(snapshot?.planName)}</span>
+            <span className="plan-badge" title={snapshot?.planError ?? snapshot?.planName}>{provider === "claude" ? snapshot?.planName ?? (loading ? "读取套餐中" : "套餐未同步") : compactPlanName(snapshot?.planName)}</span>
           </div>
         </div>
 
         <div className="source-toolbar">
           <div className="source-tabs" role="group" aria-label="用量来源">
-            {([{ mode: "codex", label: "Codex" }, { mode: "claude", label: "Claude" }, { mode: "rotate", label: "自动轮播" }] satisfies Array<{mode: UsageMode; label: string}>).map(({mode, label}) => (
-              <button key={mode} aria-pressed={settings?.usageMode === mode} disabled={!settings || switching} onClick={() => void changeMode(mode)}>{label}</button>
+            {([{ mode: "codex", label: "Codex" }, { mode: "claude", label: "Claude" }, { mode: "rotate", label: "自动轮播" }] satisfies Array<{mode: UsageMode; label: string}>).filter(({mode}) => mode === "codex" || claudeMonitoringEnabled).map(({mode, label}) => (
+              <button key={mode} aria-pressed={settings?.usageMode === mode} disabled={!claudeMonitoringEnabled || switching} onClick={() => void changeMode(mode)}>{label}</button>
             ))}
           </div>
           <div className="source-actions">
             <button className="comparison-button" aria-label="Codex 与 Claude 同周期对比" aria-expanded={analyticsView === "providers"} aria-controls="usage-comparison-panel"
               onClick={() => setAnalyticsView((previous) => previous === "providers" ? null : "providers")}><ArrowLeftRight size={14} />同周期对比</button>
-            <button className="settings-button" title="显示设置：屏幕、轮播间隔、Claude 接入" aria-label="显示设置" disabled={!settings} onClick={() => setSettingsOpen(true)}><Settings2 size={16} /></button>
+            <button className="settings-button" title="显示设置" aria-label="显示设置" disabled={!settings} onClick={() => setSettingsOpen(true)}><Settings2 size={16} /></button>
           </div>
         </div>
         {error && snapshot && <div className="data-warning" role="alert">更新失败，显示上次数据：{error}</div>}

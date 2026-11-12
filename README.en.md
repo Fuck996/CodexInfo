@@ -48,7 +48,7 @@ All data comes from the local Codex / ChatGPT login state and local session logs
 
 ### Claude Code setup
 
-Claude monitoring is off by default. Enable it in Display settings after connecting the bridge. Turning it off stops background collection and keeps local history available for comparisons.
+Claude monitoring is off by default. Enable it in Display settings after connecting the bridge. Turning it off stops background collection, switches the display to Codex, and hides the Claude and rotation controls. Local history remains available for comparisons.
 
 Open Display settings in CodexInfo and select Connect Claude Code. The app installs a local plugin using the official Claude CLI, including the CLI bundled with Microsoft Store Claude Desktop. After signing in through the official CLI, CodexInfo runs a background host to collect account usage at least 30 minutes apart, including consumption from Projects, web, and desktop chat. Existing Code sessions can run `/reload-plugins` to record their request tokens. Desktop's bundled Claude Code needs v2.1.286 or later. The terminal CLI needs v2.1.287 or later.
 

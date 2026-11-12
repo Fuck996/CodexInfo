@@ -48,7 +48,7 @@ CodexInfo 优先读取本机 Codex 的真实数据：
 
 ### Claude Code 接入
 
-Claude 监控默认关闭。接入后，在 CodexInfo 的显示设置中开启「启用 Claude 监控」才会采集额度与 Code Token。关闭后会停止后台查询，保留本地历史供同周期对比。
+Claude 监控默认关闭。接入后，在 CodexInfo 的显示设置中开启「启用 Claude 监控」才会采集额度与 Code Token。关闭后切回 Codex，隐藏 Claude 和轮播入口，并保留本地历史供同周期对比。
 
 1. 在 Claude 桌面版打开 Code 页，或安装终端版 Claude Code。桌面版内置 Claude Code 需至少 v2.1.286，终端版需至少 v2.1.287。
 2. 启动新版本 CodexInfo，打开“显示设置”，点击“接入 Claude Code”。组件通过 Claude 官方 CLI 安装本地 `codexinfo-usage` 插件；支持普通桌面版及 Microsoft Store 版的内置 CLI，终端版需可从 PATH 找到 `claude.exe`。
