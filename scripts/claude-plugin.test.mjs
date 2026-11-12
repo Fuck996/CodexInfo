@@ -14,14 +14,14 @@ function harness() {
   const exports = [];
   const requests = [];
   const logs = [];
+  const delays = [];
   let tick;
   let cancelled = false;
-  let scheduled = 0;
   register((event, handler) => handlers.set(event, handler));
   const api = {
     plugin: { root: "plugin" },
     session: { id: async () => "session:opaque/id", authorize: async () => ({ handle: "opaque-handle", kind: "bearer" }) },
-    clock: { after: (ms, callback) => { assert.equal(ms, 120_000); scheduled++; tick = callback; return { cancel: () => { cancelled = true; } }; } },
+    clock: { after: (ms, callback) => { delays.push(ms); tick = callback; return { cancel: () => { cancelled = true; } }; } },
     ui: { log: (message) => logs.push(message) },
     http: { fetch: async (url, init) => {
       requests.push({ url, init });
@@ -35,16 +35,15 @@ function harness() {
     } },
     fs: { read: async () => JSON.stringify({ executable: "collector.exe", directory: "readings" }) },
     process: { run: async (argv, options) => {
-      if (argv[1] === "--claude-poll-claim") return { exitCode: 0, stdout: '{"granted":true}', stderr: "" };
+      if (argv[1] === "--claude-poll-claim") return { exitCode: 0, stdout: '{"granted":true,"retryInMs":150000}', stderr: "" };
       exports.push({ argv, reading: JSON.parse(options.stdin) });
       return { exitCode: 0, stdout: "", stderr: "" };
     } }
   };
-  return { api, handlers, exports, requests, logs,
+  return { api, handlers, exports, requests, logs, delays,
     start: async () => { await handlers.get("session.start")(api, {}, async () => ({})); await setImmediate(); },
     tick: async () => { tick(); await setImmediate(); },
-    cancelled: () => cancelled,
-    scheduled: () => scheduled
+    cancelled: () => cancelled
   };
 }
 
@@ -100,11 +99,16 @@ test("profile display names follow vendor validation and unknown plans stay expl
 
 test("another session's claim prevents duplicate account requests", async () => {
   const h = harness();
-  h.api.process.run = async () => ({ exitCode: 0, stdout: '{"granted":false}' });
+  const run = h.api.process.run;
+  h.api.process.run = async () => ({ exitCode: 0, stdout: '{"granted":false,"retryInMs":3599000}' });
   await h.start();
-  await h.tick();
+  assert.deepEqual(h.delays, [3_599_000]);
   assert.equal(h.requests.length, 0);
   assert.equal(h.exports.length, 0);
+  h.api.process.run = run;
+  await h.tick();
+  await waitForExport(h.exports, 1);
+  assert.deepEqual(h.delays, [3_599_000, 150_000]);
 });
 
 test("rate limiting is exported with server retry delay and no stale snapshot", async () => {
@@ -115,6 +119,7 @@ test("rate limiting is exported with server retry delay and no stale snapshot", 
   assert.equal(h.exports[0].reading.retryAfterSecs, 700);
   assert.equal(h.exports[0].reading.statusCode, 429);
   assert.match(h.exports[0].reading.message, /HTTP 429/);
+  assert.deepEqual(h.delays, [700_000]);
 });
 
 test("authorization rejection is exported distinctly for official host renewal", async () => {
@@ -187,7 +192,7 @@ test("ending session cancels polling and discards outstanding response", async (
   await h.handlers.get("session.end")(h.api, {}, async () => ({}));
   resolve({ ok: true, text: '{"five_hour":{"utilization":10,"resets_at":"2027-01-01T00:00:00Z"}}' });
   await setImmediate();
-  assert.equal(h.scheduled(), 0);
+  assert.deepEqual(h.delays, []);
   assert.equal(h.exports.length, 0);
 });
 
@@ -196,13 +201,13 @@ test("the next poll is scheduled after completion so a slow first claim cannot s
   let resolve;
   h.api.http.fetch = () => new Promise((done) => { resolve = done; });
   await h.start();
-  assert.equal(h.scheduled(), 0);
+  assert.deepEqual(h.delays, []);
   const fetch = async () => ({ ok: true, status: 200, text: '{"organization":{"organization_type":"claude_pro"}}' });
   h.api.http.fetch = fetch;
   resolve({ ok: true, text: '{"five_hour":{"utilization":42,"resets_at":null}}' });
   await waitForExport(h.exports, 1);
   await setImmediate();
-  assert.equal(h.scheduled(), 1);
+  assert.deepEqual(h.delays, [150_000]);
   await h.handlers.get("session.end")(h.api, {}, async () => ({}));
   assert.equal(h.cancelled(), true);
 });

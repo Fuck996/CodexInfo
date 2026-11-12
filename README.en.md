@@ -48,7 +48,7 @@ All data comes from the local Codex / ChatGPT login state and local session logs
 
 ### Claude Code setup
 
-Open Display settings in CodexInfo and select Connect Claude Code. The app installs a local plugin using the official Claude CLI, including the CLI bundled with Microsoft Store Claude Desktop. Run `/reload-plugins` in an existing Code session and keep it open. The plugin queries account usage immediately and every two minutes, covering Projects, web, and desktop chat consumption. No model request is needed. Desktop's bundled Claude Code needs v2.1.286 or later; the terminal CLI needs v2.1.287 or later.
+Open Display settings in CodexInfo and select Connect Claude Code. The app installs a local plugin using the official Claude CLI, including the CLI bundled with Microsoft Store Claude Desktop. Run `/reload-plugins` in an existing Code session and keep it open. The plugin queries account usage at least 150 seconds apart, covering Projects, web, and desktop chat consumption. No model request is needed. Desktop's bundled Claude Code needs v2.1.286 or later; the terminal CLI needs v2.1.287 or later.
 
 The plugin uses official Mods `session.authorize` to obtain an opaque handle, then asks the Claude host to call its internal `/api/oauth/usage` endpoint. Credentials remain inside Claude. Only counters, timestamps, session/request identifiers, and models are exported. The `turn.step` observer still records Code Tokens/model. A local file lock coordinates polling across sessions, and HTTP 429 respects `Retry-After`. Account readings replace one file atomically; Token requests are deduplicated by identifier. Reconnect after moving the portable executable so the plugin uses its new path.
 

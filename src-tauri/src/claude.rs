@@ -51,7 +51,14 @@ struct PollLease {
     next_at: DateTime<Utc>,
 }
 
-const POLL_INTERVAL_SECS: i64 = 120;
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PollClaim {
+    granted: bool,
+    retry_in_ms: i64,
+}
+
+const POLL_INTERVAL_SECS: i64 = 150;
 const MAX_READING_AGE_SECS: i64 = 5 * 60;
 
 fn poll_lock(directory: &Path) -> Result<File, String> {
@@ -81,7 +88,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     Ok(())
 }
 
-fn claim_poll(directory: &Path, now: DateTime<Utc>) -> Result<bool, String> {
+fn claim_poll(directory: &Path, now: DateTime<Utc>) -> Result<PollClaim, String> {
     let _lock = poll_lock(directory)?;
     let path = directory.join("poll-lease.json");
     if path.exists() {
@@ -89,7 +96,10 @@ fn claim_poll(directory: &Path, now: DateTime<Utc>) -> Result<bool, String> {
             serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
                 .map_err(|error| format!("Claude 查询限频状态损坏: {error}"))?;
         if lease.next_at > now {
-            return Ok(false);
+            return Ok(PollClaim {
+                granted: false,
+                retry_in_ms: (lease.next_at - now).num_milliseconds() + 1,
+            });
         }
     }
     write_json(
@@ -98,7 +108,10 @@ fn claim_poll(directory: &Path, now: DateTime<Utc>) -> Result<bool, String> {
             next_at: now + chrono::Duration::seconds(POLL_INTERVAL_SECS),
         },
     )?;
-    Ok(true)
+    Ok(PollClaim {
+        granted: true,
+        retry_in_ms: POLL_INTERVAL_SECS * 1000,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,8 +243,8 @@ pub fn handle_cli() -> bool {
                 println!("{}", install(Path::new(&directory), &executable)?);
                 Ok(())
             } else if claim {
-                let granted = claim_poll(Path::new(&directory), Utc::now())?;
-                println!("{}", serde_json::json!({"granted":granted}));
+                let claim = claim_poll(Path::new(&directory), Utc::now())?;
+                println!("{}", serde_json::to_string(&claim).map_err(|error| error.to_string())?);
                 Ok(())
             } else {
                 collect(Path::new(&directory), io::stdin().lock())
@@ -781,15 +794,23 @@ mod tests {
         let granted = workers
             .into_iter()
             .map(|worker| worker.join().unwrap())
-            .filter(|granted| *granted)
+            .filter(|claim| claim.granted)
             .count();
         assert_eq!(granted, 1);
-        assert!(claim_poll(&directory, now + chrono::Duration::seconds(121)).unwrap());
+        let early = claim_poll(&directory, now + chrono::Duration::seconds(120)).unwrap();
+        assert!(!early.granted);
+        assert_eq!(early.retry_in_ms, 30_001);
+        let due = claim_poll(&directory, now + chrono::Duration::seconds(150)).unwrap();
+        assert!(due.granted);
+        assert_eq!(due.retry_in_ms, 150_000);
         let failure =
             json!({"type":"syncFailure","updatedAt":now,"message":"HTTP 429","retryAfterSecs":700});
         collect(&directory, failure.to_string().as_bytes()).unwrap();
-        assert!(!claim_poll(&directory, now + chrono::Duration::seconds(300)).unwrap());
-        assert!(claim_poll(&directory, now + chrono::Duration::seconds(701)).unwrap());
+        let lease: PollLease = serde_json::from_slice(&fs::read(directory.join("poll-lease.json")).unwrap()).unwrap();
+        let cooling_down = claim_poll(&directory, lease.next_at - chrono::Duration::seconds(400)).unwrap();
+        assert!(!cooling_down.granted);
+        assert_eq!(cooling_down.retry_in_ms, 400_001);
+        assert!(claim_poll(&directory, lease.next_at).unwrap().granted);
         fs::remove_dir_all(directory).unwrap();
     }
 

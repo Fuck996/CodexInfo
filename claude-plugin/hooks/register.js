@@ -1,14 +1,21 @@
+const defaultPollDelayMs = 150_000;
+const maxTimerDelayMs = 2_147_483_647;
+
 async function synchronize($, state) {
   if (state.inFlight || state.stopped) return;
   state.inFlight = true;
   let claimed = false;
+  let pollDelayMs = defaultPollDelayMs;
   try {
     const config = JSON.parse(await $.fs.read(`${$.plugin.root}/bridge.json`));
     const result = await $.process.run([config.executable, "--claude-poll-claim", config.directory], { timeoutMs: 5000 });
     if (result.exitCode !== 0) throw new Error(`账号查询限频失败：${result.stderr}`);
     const lease = JSON.parse(result.stdout);
     if (typeof lease.granted !== "boolean") throw new Error("账号查询限频响应无效");
-    if (!lease.granted) return;
+    // Older collectors only return whether the claim was granted.
+    pollDelayMs = lease.retryInMs ?? defaultPollDelayMs;
+    if (!Number.isSafeInteger(pollDelayMs) || pollDelayMs <= 0) throw new Error("账号查询限频等待时间无效");
+    if (!lease.granted) return pollDelayMs;
     claimed = true;
     const authorization = await $.session.authorize();
     if (!authorization || authorization.kind !== "bearer") throw new Error("当前 Code 会话没有 Claude 订阅授权");
@@ -28,14 +35,17 @@ async function synchronize($, state) {
       sessionId: await fileIdentifier(await $.session.id()),
       updatedAt: new Date().toISOString(), rateLimits, ...plan
     });
+    return pollDelayMs;
   } catch (error) {
     if (!claimed || state.stopped) throw error;
+    const retryAfterSecs = error instanceof QuotaReadError ? error.retryAfterSecs : 120;
     await exportReading($, {
       type: "syncFailure", updatedAt: new Date().toISOString(),
       message: error instanceof Error ? error.message : String(error),
       statusCode: error instanceof QuotaReadError ? error.statusCode : null,
-      retryAfterSecs: error instanceof QuotaReadError ? error.retryAfterSecs : 120
+      retryAfterSecs
     });
+    return Math.max(pollDelayMs, retryAfterSecs * 1000);
   } finally { state.inFlight = false; }
 }
 
@@ -64,12 +74,13 @@ async function subscriptionPlan($, authorization) {
 }
 
 function tick($, state) {
-  void synchronize($, state)
-    .catch((error) => $.ui.log(`CodexInfo 同步失败：${error instanceof Error ? error.message : String(error)}`))
-    .finally(() => {
-      // 从查询完成后计时，避免定时器先于共享查询锁到期而跳过一轮。
-      if (!state.stopped) state.timer = $.clock.after(120_000, () => tick($, state));
-    });
+  const schedule = (delay = defaultPollDelayMs) => {
+    if (!state.stopped) state.timer = $.clock.after(Math.min(delay, maxTimerDelayMs), () => tick($, state));
+  };
+  void synchronize($, state).then(schedule, (error) => {
+    $.ui.log(`CodexInfo 同步失败：${error instanceof Error ? error.message : String(error)}`);
+    schedule();
+  });
 }
 
 export function register(on) {
