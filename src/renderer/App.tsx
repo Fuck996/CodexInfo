@@ -243,6 +243,7 @@ export function App() {
 
   const provider = settings?.activeProvider ?? "codex";
   const providerName = provider === "claude" ? "Claude" : "Codex";
+  const monitoringDisabled = provider === "claude" && settings?.claudeMonitoringEnabled === false;
 
   useEffect(() => {
     if (!settings) return;
@@ -252,6 +253,11 @@ export function App() {
     setLoading(true);
     setError("");
     setCodexConnected(false);
+    if (monitoringDisabled) {
+      setError("Claude 监控已关闭，可在显示设置中开启。");
+      setLoading(false);
+      return;
+    }
 
     function applySnapshot(usage: UsageSnapshot, connected?: boolean) {
       setSnapshot(usage);
@@ -302,7 +308,7 @@ export function App() {
       mounted = false;
       window.clearInterval(timer);
     };
-  }, [provider, settings !== null]);
+  }, [provider, settings !== null, monitoringDisabled]);
 
   const windows = useMemo(() => sortWindows(snapshot?.windows ?? []), [snapshot?.windows]);
   const sortedResets = useMemo(
@@ -381,7 +387,7 @@ export function App() {
             <strong className="brand-title"><span>{providerName.toUpperCase()}</span><em>用量核心</em></strong>
           </div>
           <div className="plan-meta">
-            <span className="plan-badge" title={snapshot?.planError ?? snapshot?.planName}>{provider === "claude" ? snapshot?.planName ?? (loading ? "读取套餐中" : "套餐未同步") : compactPlanName(snapshot?.planName)}</span>
+            <span className="plan-badge" title={snapshot?.planError ?? snapshot?.planName}>{provider === "claude" ? snapshot?.planName ?? (monitoringDisabled ? "监控已关闭" : loading ? "读取套餐中" : "套餐未同步") : compactPlanName(snapshot?.planName)}</span>
           </div>
         </div>
 

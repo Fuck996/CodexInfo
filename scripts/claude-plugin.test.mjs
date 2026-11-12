@@ -35,7 +35,8 @@ function harness() {
     } },
     fs: { read: async () => JSON.stringify({ executable: "collector.exe", directory: "readings" }) },
     process: { run: async (argv, options) => {
-      if (argv[1] === "--claude-poll-claim") return { exitCode: 0, stdout: '{"granted":true,"retryInMs":150000}', stderr: "" };
+      if (argv[1] === "--claude-poll-claim") return { exitCode: 0, stdout: '{"granted":true,"retryInMs":1800000}', stderr: "" };
+      if (argv[1] === "--claude-monitoring-status") return { exitCode: 0, stdout: "true", stderr: "" };
       exports.push({ argv, reading: JSON.parse(options.stdin) });
       return { exitCode: 0, stdout: "", stderr: "" };
     } }
@@ -108,18 +109,40 @@ test("another session's claim prevents duplicate account requests", async () => 
   h.api.process.run = run;
   await h.tick();
   await waitForExport(h.exports, 1);
-  assert.deepEqual(h.delays, [3_599_000, 150_000]);
+  assert.deepEqual(h.delays, [3_599_000, 1_800_000]);
+});
+
+test("turning off monitoring during a usage request prevents the profile request and export", async () => {
+  const h = harness();
+  const run = h.api.process.run;
+  const fetch = h.api.http.fetch;
+  h.api.http.fetch = async (url, init) => {
+    h.api.process.run = (argv, options) => argv[1] === "--claude-monitoring-status"
+      ? Promise.resolve({ exitCode: 0, stdout: "false", stderr: "" })
+      : run(argv, options);
+    return fetch(url, init);
+  };
+  await h.start();
+  assert.deepEqual(h.requests.map(({ url }) => new URL(url).pathname), ["/api/oauth/usage"]);
+  assert.equal(h.exports.length, 0);
+  assert.deepEqual(h.delays, [1_800_000]);
 });
 
 test("rate limiting is exported with server retry delay and no stale snapshot", async () => {
-  const h = harness();
-  h.api.http.fetch = async () => ({ ok: false, status: 429, headers: { "retry-after": "700" } });
-  await h.start();
-  assert.equal(h.exports[0].reading.type, "syncFailure");
-  assert.equal(h.exports[0].reading.retryAfterSecs, 700);
-  assert.equal(h.exports[0].reading.statusCode, 429);
-  assert.match(h.exports[0].reading.message, /HTTP 429/);
-  assert.deepEqual(h.delays, [700_000]);
+  for (const [headers, retryAfterSecs, delayMs] of [
+    [{ "retry-after": "700" }, 700, 1_800_000],
+    [{ "retry-after": "7200" }, 7200, 7_200_000],
+    [{}, 3600, 3_600_000]
+  ]) {
+    const h = harness();
+    h.api.http.fetch = async () => ({ ok: false, status: 429, headers });
+    await h.start();
+    assert.equal(h.exports[0].reading.type, "syncFailure");
+    assert.equal(h.exports[0].reading.retryAfterSecs, retryAfterSecs);
+    assert.equal(h.exports[0].reading.statusCode, 429);
+    assert.match(h.exports[0].reading.message, /HTTP 429/);
+    assert.deepEqual(h.delays, [delayMs]);
+  }
 });
 
 test("authorization rejection is exported distinctly for official host renewal", async () => {
@@ -207,7 +230,7 @@ test("the next poll is scheduled after completion so a slow first claim cannot s
   resolve({ ok: true, text: '{"five_hour":{"utilization":42,"resets_at":null}}' });
   await waitForExport(h.exports, 1);
   await setImmediate();
-  assert.deepEqual(h.delays, [150_000]);
+  assert.deepEqual(h.delays, [1_800_000]);
   await h.handlers.get("session.end")(h.api, {}, async () => ({}));
   assert.equal(h.cancelled(), true);
 });

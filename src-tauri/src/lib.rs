@@ -177,6 +177,7 @@ struct UsageSnapshot {
 struct AppSettings {
     usage_mode: UsageMode,
     active_provider: UsageProvider,
+    claude_monitoring_enabled: bool,
     rotation_interval_secs: u64,
     selected_monitor: Option<String>,
     launch_at_startup: bool,
@@ -2092,7 +2093,9 @@ fn read_explicit_snapshot(app: &AppHandle) -> Option<DiscoveredSnapshot> {
 #[tauri::command]
 fn get_cached_usage_snapshot(app: AppHandle, provider: UsageProvider) -> Result<Option<UsageSnapshot>, String> {
     if provider == UsageProvider::Claude {
-        return claude::read_snapshot(&app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings")).map(Some);
+        let readings = app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings");
+        if !claude::monitoring_enabled(&readings)? { return Ok(None); }
+        return claude::read_snapshot(&readings).map(Some);
     }
     let path = usage_cache_path(&app)?;
     if !path.exists() {
@@ -2118,9 +2121,17 @@ async fn get_usage_snapshot(app: AppHandle, provider: UsageProvider) -> Result<U
 fn load_usage_snapshot(app: &AppHandle, provider: UsageProvider, include_tokens: bool) -> Result<UsageSnapshot, String> {
     if provider == UsageProvider::Claude {
         let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
+        let readings = root.join("claude-readings");
         let state = app.state::<AppState>();
-        let host = state.claude_host.lock().map_err(|error| error.to_string())?.ensure_running(&root);
-        let mut snapshot = claude::read_snapshot(&root.join("claude-readings"))
+        let host = {
+            let mut host = state.claude_host.lock().map_err(|error| error.to_string())?;
+            if !claude::monitoring_enabled(&readings)? {
+                host.shutdown()?;
+                return Err(claude::MONITORING_DISABLED.into());
+            }
+            host.ensure_running(&root)
+        };
+        let mut snapshot = claude::read_snapshot(&readings)
             .map_err(|error| match &host { Ok(()) => error, Err(host_error) => format!("{host_error}\n{error}") })?;
         if let Err(error) = host {
             snapshot.usage_warning = Some(match snapshot.usage_warning.take() {
@@ -2130,7 +2141,7 @@ fn load_usage_snapshot(app: &AppHandle, provider: UsageProvider, include_tokens:
         }
         if include_tokens {
             let mut token_cache = state.claude_usage_cache.lock().map_err(|error| error.to_string())?;
-            let samples = claude::token_samples(&root.join("claude-readings"), &mut token_cache)?;
+            let samples = claude::token_samples(&readings, &mut token_cache)?;
             let mut history = state.analytics_history.lock().map_err(|error| error.to_string())?;
             analytics::enrich(&root, &mut history, &mut snapshot, &samples)?;
         } else {
@@ -2151,11 +2162,10 @@ fn load_usage_snapshot(app: &AppHandle, provider: UsageProvider, include_tokens:
 #[tauri::command]
 async fn get_usage_comparison(app: AppHandle) -> Result<analytics::ProviderComparison, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let codex = load_usage_snapshot(&app, UsageProvider::Codex, false)?;
-        let claude = load_usage_snapshot(&app, UsageProvider::Claude, false)?;
+        let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
         let state = app.state::<AppState>();
-        let history = state.analytics_history.lock().map_err(|error| error.to_string())?;
-        analytics::compare_providers(&history, &codex, &claude)
+        let mut history = state.analytics_history.lock().map_err(|error| error.to_string())?;
+        analytics::compare_providers(&root, &mut history)
     }).await.map_err(|error| format!("同周期对比任务失败: {error}"))?
 }
 
@@ -2207,9 +2217,11 @@ fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
         .map_err(|error| error.to_string())?;
     let stored = read_stored_settings(&app)?;
     let dock_enabled = stored.dock_enabled || stored.taskbar_usage_enabled;
+    let readings = app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings");
     Ok(AppSettings {
         usage_mode: stored.usage_mode,
         active_provider: app.state::<AppState>().usage_display.lock().map_err(|error| error.to_string())?.provider,
+        claude_monitoring_enabled: claude::monitoring_enabled(&readings)?,
         rotation_interval_secs: stored.rotation_interval_secs,
         selected_monitor: stored.selected_monitor,
         launch_at_startup,
@@ -2281,6 +2293,23 @@ async fn install_claude_bridge(app: AppHandle) -> Result<String, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || claude::install(&directory, &executable))
         .await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn set_claude_monitoring_enabled(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let readings = app.path().app_data_dir().map_err(|error| error.to_string())?.join("claude-readings");
+        claude::set_monitoring_enabled(&readings, enabled)?;
+        let state = app.state::<AppState>();
+        let stopped = if !enabled {
+            state.claude_host.lock().map_err(|error| error.to_string())?.shutdown()
+        } else {
+            Ok(())
+        };
+        notify_usage_display(&app, &state);
+        stopped?;
+        get_settings(app)
+    }).await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2896,6 +2925,7 @@ pub fn run() {
             monitors::set_selected_monitor,
             set_settings_open,
             install_claude_bridge,
+            set_claude_monitoring_enabled,
             set_launch_at_startup,
             set_tray_usage_enabled,
             set_dock_enabled,

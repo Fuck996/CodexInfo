@@ -1,4 +1,4 @@
-const defaultPollDelayMs = 150_000;
+const defaultPollDelayMs = 30 * 60_000;
 const maxTimerDelayMs = 2_147_483_647;
 
 async function synchronize($, state) {
@@ -13,12 +13,14 @@ async function synchronize($, state) {
     const lease = JSON.parse(result.stdout);
     if (typeof lease.granted !== "boolean") throw new Error("账号查询限频响应无效");
     // Older collectors only return whether the claim was granted.
-    pollDelayMs = lease.retryInMs ?? defaultPollDelayMs;
-    if (!Number.isSafeInteger(pollDelayMs) || pollDelayMs <= 0) throw new Error("账号查询限频等待时间无效");
-    if (!lease.granted) return pollDelayMs;
+    const retryInMs = lease.retryInMs ?? defaultPollDelayMs;
+    if (!Number.isSafeInteger(retryInMs) || retryInMs <= 0) throw new Error("账号查询限频等待时间无效");
+    if (!lease.granted) return retryInMs;
+    pollDelayMs = Math.max(defaultPollDelayMs, retryInMs);
     claimed = true;
     const authorization = await $.session.authorize();
     if (!authorization || authorization.kind !== "bearer") throw new Error("当前 Code 会话没有 Claude 订阅授权");
+    if (!await monitoringEnabled($, config) || state.stopped) return pollDelayMs;
     const response = await $.http.fetch("https://api.anthropic.com/api/oauth/usage", {
       auth: authorization.handle,
       headers: { "anthropic-beta": "oauth-2025-04-20" }
@@ -28,7 +30,7 @@ async function synchronize($, state) {
     try { body = JSON.parse(response.text); }
     catch { throw new Error("Claude 账号用量响应不是有效 JSON"); }
     const rateLimits = quotaWindows(body);
-    if (state.stopped) return;
+    if (state.stopped || !await monitoringEnabled($, config)) return pollDelayMs;
     const plan = await subscriptionPlan($, authorization);
     if (!state.stopped) await exportReading($, {
       type: "reading", source: "account",
@@ -47,6 +49,14 @@ async function synchronize($, state) {
     });
     return Math.max(pollDelayMs, retryAfterSecs * 1000);
   } finally { state.inFlight = false; }
+}
+
+async function monitoringEnabled($, config) {
+  const status = await $.process.run([config.executable, "--claude-monitoring-status", config.directory], { timeoutMs: 5000 });
+  if (status.exitCode !== 0) throw new Error(`读取 Claude 监控状态失败：${status.stderr}`);
+  const enabled = JSON.parse(status.stdout);
+  if (typeof enabled !== "boolean") throw new Error("Claude 监控状态响应无效");
+  return enabled;
 }
 
 async function subscriptionPlan($, authorization) {
@@ -125,7 +135,7 @@ function retryDelay(response) {
   const value = response.headers["retry-after"];
   const seconds = value && /^\d+$/.test(value) ? Number(value) : (Date.parse(value) - Date.now()) / 1000;
   if (Number.isFinite(seconds) && seconds > 0) return Math.max(120, Math.ceil(seconds));
-  return response.status === 429 ? 600 : 120;
+  return response.status === 429 ? 3600 : 120;
 }
 
 function quotaWindows(body) {

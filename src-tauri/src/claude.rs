@@ -58,8 +58,28 @@ struct PollClaim {
     retry_in_ms: i64,
 }
 
-const POLL_INTERVAL_SECS: i64 = 150;
-const MAX_READING_AGE_SECS: i64 = 5 * 60;
+const POLL_INTERVAL_SECS: i64 = 30 * 60;
+const MAX_READING_AGE_SECS: i64 = POLL_INTERVAL_SECS + 5 * 60;
+const MONITORING_FLAG: &str = ".monitoring-enabled";
+pub(super) const MONITORING_DISABLED: &str = "Claude 监控已关闭，可在显示设置中开启。";
+
+pub(super) fn monitoring_enabled(directory: &Path) -> Result<bool, String> {
+    directory.join(MONITORING_FLAG).try_exists().map_err(|error| error.to_string())
+}
+
+pub(super) fn set_monitoring_enabled(directory: &Path, enabled: bool) -> Result<(), String> {
+    let _lock = poll_lock(directory)?;
+    let path = directory.join(MONITORING_FLAG);
+    if enabled {
+        File::create(path).map(|_| ()).map_err(|error| error.to_string())
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
 
 fn poll_lock(directory: &Path) -> Result<File, String> {
     fs::create_dir_all(directory).map_err(|error| error.to_string())?;
@@ -90,6 +110,9 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
 
 fn claim_poll(directory: &Path, now: DateTime<Utc>) -> Result<PollClaim, String> {
     let _lock = poll_lock(directory)?;
+    if !monitoring_enabled(directory)? {
+        return Ok(PollClaim { granted: false, retry_in_ms: POLL_INTERVAL_SECS * 1000 });
+    }
     let path = directory.join("poll-lease.json");
     if path.exists() {
         let lease: PollLease =
@@ -164,7 +187,7 @@ fn validate(reading: &Reading) -> Result<(), String> {
 pub fn collect(directory: &Path, input: impl Read) -> Result<(), String> {
     let exported: Export = serde_json::from_reader(input.take(64 * 1024))
         .map_err(|error| format!("Claude 用量数据无效: {error}"))?;
-    let (directory, id) = match &exported {
+    let (destination_dir, id) = match &exported {
         Export::SyncFailure(failure) => {
             if failure.message.is_empty() || failure.message.len() > 4096 {
                 return Err("Claude 同步错误说明无效".into());
@@ -221,8 +244,11 @@ pub fn collect(directory: &Path, input: impl Read) -> Result<(), String> {
             (directory.join("tokens"), id.clone())
         }
     };
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let destination = directory.join(format!("{id}.json"));
+    if !monitoring_enabled(directory)? {
+        return Ok(());
+    }
+    fs::create_dir_all(&destination_dir).map_err(|error| error.to_string())?;
+    let destination = destination_dir.join(format!("{id}.json"));
     write_json(&destination, &exported)
 }
 
@@ -230,8 +256,9 @@ pub fn handle_cli() -> bool {
     let mut args = std::env::args_os().skip(1);
     let command = args.next();
     let claim = command.as_deref() == Some(std::ffi::OsStr::new("--claude-poll-claim"));
+    let status = command.as_deref() == Some(std::ffi::OsStr::new("--claude-monitoring-status"));
     let install_bridge = command.as_deref() == Some(std::ffi::OsStr::new("--claude-install"));
-    if !claim && !install_bridge && command.as_deref() != Some(std::ffi::OsStr::new("--claude-usage")) {
+    if !claim && !status && !install_bridge && command.as_deref() != Some(std::ffi::OsStr::new("--claude-usage")) {
         return false;
     }
     let result = args
@@ -245,6 +272,9 @@ pub fn handle_cli() -> bool {
             } else if claim {
                 let claim = claim_poll(Path::new(&directory), Utc::now())?;
                 println!("{}", serde_json::to_string(&claim).map_err(|error| error.to_string())?);
+                Ok(())
+            } else if status {
+                println!("{}", monitoring_enabled(Path::new(&directory))?);
                 Ok(())
             } else {
                 collect(Path::new(&directory), io::stdin().lock())
@@ -333,7 +363,7 @@ pub fn read_snapshot(directory: &Path) -> Result<UsageSnapshot, String> {
     })?;
     let now = Utc::now();
     if now.signed_duration_since(reading.updated_at).num_seconds() > MAX_READING_AGE_SECS {
-        return Err(format!("Claude 账号用量超过 5 分钟未更新（最近读数：{}）。后台额度采集尚未恢复，当前不能比较。", reading.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S")));
+        return Err(format!("Claude 账号用量超过 {} 分钟未更新（最近读数：{}）。等待后台重新采集。", MAX_READING_AGE_SECS / 60, reading.updated_at.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S")));
     }
     let mut unavailable_windows = Vec::new();
     let windows = reading
@@ -490,7 +520,7 @@ pub fn install(root: &Path, executable: &Path) -> Result<String, String> {
         &cli,
         &["plugin", "update", "codexinfo-usage@codexinfo-local"],
     )?;
-    Ok("Claude 账号用量已接入。组件会自动启动后台查询宿主；请先完成 Claude Code 官方登录，之后使用 Projects 或普通聊天也能同步账号额度。已有 Code 会话可执行 /reload-plugins 继续采集该会话的 Token。".into())
+    Ok("Claude 账号用量已接入。完成 Claude Code 官方登录并启用监控后，组件会同步账号额度。已有 Code 会话可执行 /reload-plugins 加载更新后的插件。".into())
 }
 
 pub(super) fn prepare_plugin(root: &Path, executable: &Path) -> Result<PathBuf, String> {
@@ -648,9 +678,7 @@ mod tests {
 
     #[test]
     fn collector_replaces_readings_and_deduplicates_requests() {
-        let directory =
-            std::env::temp_dir().join(format!("codexinfo-claude-test-{}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
+        let directory = test_directory("collector");
         let result = (|| -> Result<(), String> {
             for used in [10, 25] {
                 let reading = json!({"type":"reading","source":"account","sessionId":"test-session","planName":"Claude Pro","updatedAt":Utc::now(),"rateLimits":[{"kind":"five_hour","percentUsed":used,"resetsAt":(Utc::now()+chrono::Duration::hours(5)).to_rfc3339()}]});
@@ -684,7 +712,7 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap()
         ));
-        fs::create_dir(&path).unwrap();
+        set_monitoring_enabled(&path, true).unwrap();
         path
     }
 
@@ -755,10 +783,13 @@ mod tests {
     #[test]
     fn failed_or_stale_account_reads_are_never_reported_as_connected() {
         let directory = test_directory("account-failure");
-        account_reading(&directory, Utc::now() - chrono::Duration::minutes(6));
+        account_reading(&directory, Utc::now() - chrono::Duration::minutes(29));
+        assert_eq!(read_snapshot(&directory).unwrap().windows[0].used, 42.5);
+        fs::remove_file(directory.join("account.json")).unwrap();
+        account_reading(&directory, Utc::now() - chrono::Duration::minutes(36));
         assert!(read_snapshot(&directory)
             .unwrap_err()
-            .contains("超过 5 分钟"));
+            .contains("超过 35 分钟"));
         let failure = json!({"type":"syncFailure","updatedAt":Utc::now(),"message":"HTTP 429","retryAfterSecs":700});
         collect(&directory, failure.to_string().as_bytes()).unwrap();
         assert!(read_snapshot(&directory).unwrap_err().contains("HTTP 429"));
@@ -782,6 +813,30 @@ mod tests {
     }
 
     #[test]
+    fn monitoring_is_opt_in_and_switching_it_off_preserves_cooldown() {
+        let root = test_directory("monitoring");
+        let readings = root.join("claude-readings");
+        let now = Utc::now();
+        assert!(!monitoring_enabled(&readings).unwrap());
+        assert!(!claim_poll(&readings, now).unwrap().granted);
+        assert!(!readings.join("poll-lease.json").exists());
+
+        set_monitoring_enabled(&readings, true).unwrap();
+        assert!(claim_poll(&readings, now).unwrap().granted);
+        set_monitoring_enabled(&readings, false).unwrap();
+        let failure = json!({"type":"syncFailure","updatedAt":now,"message":"HTTP 429","statusCode":429,"retryAfterSecs":3600});
+        collect(&readings, failure.to_string().as_bytes()).unwrap();
+        account_reading(&readings, now);
+        assert!(!readings.join("account.json").exists());
+        assert!(!claim_poll(&readings, now + chrono::Duration::hours(2)).unwrap().granted);
+
+        set_monitoring_enabled(&readings, true).unwrap();
+        assert!(!claim_poll(&readings, now + chrono::Duration::minutes(45)).unwrap().granted);
+        assert!(claim_poll(&readings, now + chrono::Duration::hours(2)).unwrap().granted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn concurrent_sessions_share_poll_budget_and_server_backoff() {
         let directory = test_directory("poll-budget");
         let now = Utc::now();
@@ -797,19 +852,19 @@ mod tests {
             .filter(|claim| claim.granted)
             .count();
         assert_eq!(granted, 1);
-        let early = claim_poll(&directory, now + chrono::Duration::seconds(120)).unwrap();
+        let early = claim_poll(&directory, now + chrono::Duration::minutes(29)).unwrap();
         assert!(!early.granted);
-        assert_eq!(early.retry_in_ms, 30_001);
-        let due = claim_poll(&directory, now + chrono::Duration::seconds(150)).unwrap();
+        assert_eq!(early.retry_in_ms, 60_001);
+        let due = claim_poll(&directory, now + chrono::Duration::minutes(30)).unwrap();
         assert!(due.granted);
-        assert_eq!(due.retry_in_ms, 150_000);
+        assert_eq!(due.retry_in_ms, 1_800_000);
         let failure =
-            json!({"type":"syncFailure","updatedAt":now,"message":"HTTP 429","retryAfterSecs":700});
+            json!({"type":"syncFailure","updatedAt":now,"message":"HTTP 429","retryAfterSecs":3600});
         collect(&directory, failure.to_string().as_bytes()).unwrap();
         let lease: PollLease = serde_json::from_slice(&fs::read(directory.join("poll-lease.json")).unwrap()).unwrap();
-        let cooling_down = claim_poll(&directory, lease.next_at - chrono::Duration::seconds(400)).unwrap();
+        let cooling_down = claim_poll(&directory, lease.next_at - chrono::Duration::minutes(20)).unwrap();
         assert!(!cooling_down.granted);
-        assert_eq!(cooling_down.retry_in_ms, 400_001);
+        assert_eq!(cooling_down.retry_in_ms, 1_200_001);
         assert!(claim_poll(&directory, lease.next_at).unwrap().granted);
         fs::remove_dir_all(directory).unwrap();
     }

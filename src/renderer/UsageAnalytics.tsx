@@ -238,14 +238,14 @@ export function QuotaComparison({ data }: { data: ProviderComparison }) {
     <p className="quota-scope">比较真实账号耗额，包含 Projects 和普通聊天。</p>
     <details className="analytics-details"><summary>统计说明与明细</summary>
       <table><thead><tr><th>周额度</th>{names.map((name) => <th key={name}>{name}</th>)}</tr></thead><tbody>
-        <tr><th>套餐</th>{periods.map((period, index) => <td key={index}>{period.planName}</td>)}</tr>
+        <tr><th>套餐</th>{periods.map((period, index) => <td key={index}>{period.planName ?? "暂未记录"}</td>)}</tr>
         <tr><th>起点已用</th>{periods.map((period, index) => <td key={index}>{period.usedFromPercent.toFixed(1)}%</td>)}</tr>
         <tr><th>终点已用</th>{periods.map((period, index) => <td key={index}>{period.usedUntilPercent.toFixed(1)}%</td>)}</tr>
         <tr><th>有效采样</th>{periods.map((period, index) => <td key={index}>{period.trend.length} 次</td>)}</tr>
         <tr><th>端点偏差</th>{periods.map((period, index) => <td key={index}>≤ {period.endpointSkewSeconds} 秒</td>)}</tr>
         <tr><th>额度回落</th>{periods.map((period, index) => <td key={index}>{period.quotaDrops} 次</td>)}</tr>
       </tbody></table>
-      <p>本段耗额 = 周额度已用百分比的增长；平均每小时耗额 = 本段耗额 ÷ 共同区间小时数。两边使用同一时间段，端点采用此前最近且不超过 3 分钟的读数，不跨周重置。</p>
+      <p>对比使用本地已记录的额度。两边使用同一时间段，端点采用此前最近且不超过 3 分钟的读数，不跨周重置。平均每小时耗额为本段周额度涨幅除以区间小时数。</p>
       <p>折线从各自起点归零。阶梯表示实际采样，虚线连接超过 3 分钟的采样间断，不推测间断内的消耗时刻。额度回落时保留原始起止读数，本段不排名。</p>
       <p>此处不依赖 Token，也不估算普通聊天的 Token。消耗高低反映各自实际使用情况，不代表相同任务的模型效率或套餐总容量。单个平台的 Token 和 API 成本仍在「本周期 / 上周期」中查看。</p>
     </details>
@@ -266,8 +266,7 @@ function quotaPaths(period: ProviderPeriod, start: number, end: number, max: num
       solid += ` M${x(point.at)},${y(point.usedPercent)}`;
     } else solid += ` H${x(point.at)} V${y(point.usedPercent)}`;
   }
-  solid += ` H384`;
-  return { solid, gaps };
+  return { solid, gaps, endpointX: x(period.quotaUntil) };
 }
 
 function QuotaTrend({ data }: { data: ProviderComparison }) {
@@ -289,7 +288,7 @@ function QuotaTrend({ data }: { data: ProviderComparison }) {
         const paths = quotaPaths(period, start, end, max);
         return <g className="quota-series" data-series={index} key={names[index]}>
           <path d={paths.solid} /><path className="quota-gap" d={paths.gaps} />
-          <circle cx="384" cy={174 - period.consumedPercent / max * 144} r={index === 0 ? 4 : 6} tabIndex={0} aria-label={`${names[index]}本段消耗 ${period.consumedPercent.toFixed(1)} 个百分点`}><title>{names[index]}：{period.consumedPercent.toFixed(1)} 个百分点</title></circle>
+          <circle cx={paths.endpointX} cy={174 - period.consumedPercent / max * 144} r={index === 0 ? 4 : 6} tabIndex={0} aria-label={`${names[index]}本段消耗 ${period.consumedPercent.toFixed(1)} 个百分点`}><title>{`${names[index]}：${period.consumedPercent.toFixed(1)} 个百分点`}</title></circle>
         </g>;
       })}
     </svg>

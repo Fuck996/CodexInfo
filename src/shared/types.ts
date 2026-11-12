@@ -81,7 +81,7 @@ export type CycleComparison = {
 };
 
 export type ProviderPeriod = {
-  planName: string;
+  planName: string | null;
   quotaFrom: string;
   quotaUntil: string;
   endpointSkewSeconds: number;
@@ -103,6 +103,7 @@ export type ProviderComparison = {
 export type AppSettings = {
   usageMode: UsageMode;
   activeProvider: UsageProvider;
+  claudeMonitoringEnabled: boolean;
   rotationIntervalSecs: number;
   selectedMonitor: string | null;
   launchAtStartup: boolean;
@@ -123,6 +124,7 @@ export type DesktopApi = {
   getMonitors: () => Promise<MonitorOption[]>;
   setSelectedMonitor: (monitorId: string | null) => Promise<AppSettings>;
   installClaudeBridge: () => Promise<string>;
+  setClaudeMonitoringEnabled: (enabled: boolean) => Promise<AppSettings>;
   setSettingsOpen: (open: boolean) => Promise<void>;
   getSettings: () => Promise<AppSettings>;
   setLaunchAtStartup: (enabled: boolean) => Promise<AppSettings>;

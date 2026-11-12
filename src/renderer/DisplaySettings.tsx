@@ -85,9 +85,14 @@ export function DisplaySettings({ settings, onChange, onClose }: {
           {[5, 10, 30, 60].map((seconds) => <option key={seconds} value={seconds}>每 {seconds} 秒</option>)}
         </select>
         <div className="claude-connection">
-          <strong>Claude 账号用量桥接</strong>
-          <p>完成 Claude Code 官方登录后，组件会自动在后台每 2 分钟查询账号额度，包含 Projects 和普通聊天的消耗。无需打开 Code 页，授权始终由 Claude 持有。</p>
-          <button className="connect-button" disabled={connecting} onClick={() => void connect()}>{connecting ? "正在接入…" : "接入 Claude Code"}</button>
+          <label htmlFor="claude-monitoring">启用 Claude 监控</label>
+          <select id="claude-monitoring" value={settings.claudeMonitoringEnabled ? "on" : "off"} disabled={saving || connecting}
+            onChange={(event) => { const enabled = event.target.value === "on"; void save(() => desktopApi.setClaudeMonitoringEnabled(enabled)); }}>
+            <option value="off">关闭</option>
+            <option value="on">开启</option>
+          </select>
+          <p>开启后，账号额度查询至少间隔 30 分钟。关闭时仍可查看本地历史对比。</p>
+          <button className="connect-button" disabled={connecting || saving} onClick={() => void connect()}>{connecting ? "正在接入…" : "接入 Claude Code"}</button>
         </div>
         {saving && <p role="status">正在保存…</p>}
         {message && <p className="settings-message" role="status">{message}</p>}

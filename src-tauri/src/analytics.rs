@@ -19,6 +19,8 @@ pub(super) struct History {
 struct Observation {
     at: DateTime<Utc>,
     windows: Vec<UsageWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,24 +66,7 @@ pub(super) fn record_snapshot(
 ) -> Result<(), String> {
     let provider = snapshot.provider.label().to_lowercase();
     let path = root.join(format!("quota-history-{provider}.jsonl"));
-    if !history.observations.contains_key(&provider) {
-        let mut observations = Vec::new();
-        if path.exists() {
-            for line in
-                BufReader::new(fs::File::open(&path).map_err(|error| error.to_string())?).lines()
-            {
-                observations.push(
-                    serde_json::from_str(&line.map_err(|error| error.to_string())?)
-                        .map_err(|error| format!("用量历史无法解析: {error}"))?,
-                );
-            }
-        }
-        history.observations.insert(provider.clone(), observations);
-    }
-    let observations = history
-        .observations
-        .get_mut(&provider)
-        .expect("history initialized");
+    let observations = load_observations(history, &provider, &path)?;
     let at = DateTime::parse_from_rfc3339(&snapshot.updated_at)
         .map_err(|error| error.to_string())?
         .with_timezone(&Utc);
@@ -89,6 +74,7 @@ pub(super) fn record_snapshot(
         let observation = Observation {
             at,
             windows: snapshot.windows.clone(),
+            plan_name: Some(snapshot.plan_name.clone()),
         };
         let serialized = serde_json::to_string(&observation).map_err(|error| error.to_string())?;
         let mut file = OpenOptions::new()
@@ -100,6 +86,31 @@ pub(super) fn record_snapshot(
         observations.push(observation);
     }
     Ok(())
+}
+
+fn load_observations<'a>(
+    history: &'a mut History,
+    provider: &str,
+    path: &Path,
+) -> Result<&'a mut Vec<Observation>, String> {
+    use std::collections::hash_map::Entry;
+    match history.observations.entry(provider.to_owned()) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            let observations = match fs::File::open(path) {
+                Ok(file) => BufReader::new(file)
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str(&line.map_err(|error| error.to_string())?)
+                            .map_err(|error| format!("用量历史无法解析: {error}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error.to_string()),
+            };
+            Ok(entry.insert(observations))
+        }
+    }
 }
 
 pub(super) fn enrich(
@@ -122,6 +133,7 @@ pub(super) fn enrich(
         points.push(Observation {
             at,
             windows: sample.windows.clone(),
+            plan_name: None,
         });
     }
     points.sort_by_key(|point| point.at);
@@ -200,7 +212,7 @@ pub(super) struct ProviderComparison {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderPeriod {
-    plan_name: String,
+    plan_name: Option<String>,
     quota_from: String,
     quota_until: String,
     endpoint_skew_seconds: i64,
@@ -222,13 +234,19 @@ struct QuotaPoint {
 struct WeeklyReadings<'a> {
     window_id: String,
     points: Vec<&'a Observation>,
+    plan_name: Option<&'a str>,
 }
 
-fn weekly_readings<'a>(history: &'a History, snapshot: &UsageSnapshot, provider: &str) -> Result<WeeklyReadings<'a>, String> {
-    let window = snapshot.windows.iter().find(|window| window.window_duration_mins == 10_080)
+fn weekly_readings<'a>(history: &'a History, provider: &str, now: DateTime<Utc>) -> Result<WeeklyReadings<'a>, String> {
+    let observations = history.observations.get(provider)
+        .ok_or_else(|| format!("{provider} 尚无周额度历史"))?;
+    let latest = observations.last().ok_or_else(|| format!("{provider} 尚无周额度历史"))?;
+    let window = latest.windows.iter().find(|window| window.window_duration_mins == 10_080)
         .ok_or_else(|| format!("{provider} 尚未提供周额度窗口"))?;
-    let reset = DateTime::parse_from_rfc3339(&window.reset_at).map_err(|error| error.to_string())?.with_timezone(&Utc);
-    let points = history.observations.get(provider).into_iter().flatten().filter(|point| {
+    let reset = DateTime::parse_from_rfc3339(&window.reset_at)
+        .map_err(|_| format!("{provider} 尚未提供周额度重置时间"))?.with_timezone(&Utc);
+    if reset <= now { return Err(format!("{provider} 等待本周第一条额度读数")); }
+    let points = observations.iter().filter(|point| {
         point.at >= reset - Duration::days(7) && point.at < reset && point.windows.iter().any(|candidate| {
             candidate.id == window.id && candidate.window_duration_mins == 10_080
                 && DateTime::parse_from_rfc3339(&candidate.reset_at)
@@ -236,21 +254,29 @@ fn weekly_readings<'a>(history: &'a History, snapshot: &UsageSnapshot, provider:
         })
     }).collect::<Vec<_>>();
     if points.len() < 2 { return Err(format!("{provider} 本周额度采样不足，等待至少两次读数")); }
-    Ok(WeeklyReadings { window_id: window.id.clone(), points })
+    Ok(WeeklyReadings { window_id: window.id.clone(), points, plan_name: latest.plan_name.as_deref() })
 }
 
 pub(super) fn compare_providers(
-    history: &History,
-    codex: &UsageSnapshot,
-    claude: &UsageSnapshot,
+    root: &Path,
+    history: &mut History,
 ) -> Result<ProviderComparison, String> {
-    let gpt = weekly_readings(history, codex, "codex")?;
-    let cl = weekly_readings(history, claude, "claude")?;
+    load_observations(history, "codex", &root.join("quota-history-codex.jsonl"))?;
+    load_observations(history, "claude", &root.join("quota-history-claude.jsonl"))?;
+    compare_recorded_providers(history, Utc::now())
+}
+
+fn compare_recorded_providers(
+    history: &History,
+    now: DateTime<Utc>,
+) -> Result<ProviderComparison, String> {
+    let gpt = weekly_readings(history, "codex", now)?;
+    let cl = weekly_readings(history, "claude", now)?;
     let (start, end) = common_bounds(&gpt, &cl)?;
     Ok(ProviderComparison {
         start_at: start.to_rfc3339(), end_at: end.to_rfc3339(),
-        codex: compare_period(&gpt, start, end, &codex.plan_name)?,
-        claude: compare_period(&cl, start, end, &claude.plan_name)?,
+        codex: compare_period(&gpt, start, end)?,
+        claude: compare_period(&cl, start, end)?,
     })
 }
 
@@ -290,14 +316,13 @@ fn common_bounds(left: &WeeklyReadings<'_>, right: &WeeklyReadings<'_>) -> Resul
 
 fn compare_period(
     readings: &WeeklyReadings<'_>, start: DateTime<Utc>, end: DateTime<Utc>,
-    plan: &str,
 ) -> Result<ProviderPeriod, String> {
     let first = readings.points.iter().rposition(|point| point.at <= start).expect("common start has prior reading");
     let last = readings.points.iter().rposition(|point| point.at <= end).expect("common end has prior reading");
     let from = readings.points[first].at;
     let until = readings.points[last].at;
     let skew = (start - from).num_seconds().max((end - until).num_seconds());
-    if skew > 180 || from >= until { return Err(format!("{plan} 共同区间端点缺少 3 分钟内的额度读数，暂不能比较")); }
+    if skew > 180 || from >= until { return Err("共同区间端点缺少 3 分钟内的额度读数，暂不能比较".into()); }
     let trend = readings.points[first..=last].iter().map(|point| {
         let window = point.windows.iter().find(|window| window.id == readings.window_id && window.window_duration_mins == 10_080)
             .expect("weekly reading has a weekly window");
@@ -308,7 +333,7 @@ fn compare_period(
     let quota_drops = trend.windows(2).filter(|pair| pair[1].used_percent < pair[0].used_percent).count();
     let consumed_percent = (quota_drops == 0).then_some(used_until_percent - used_from_percent);
     let hours = (end - start).num_milliseconds() as f64 / 3_600_000.0;
-    Ok(ProviderPeriod { plan_name: plan.into(), quota_from: from.to_rfc3339(),
+    Ok(ProviderPeriod { plan_name: readings.plan_name.map(str::to_owned), quota_from: from.to_rfc3339(),
         quota_until: until.to_rfc3339(), endpoint_skew_seconds: skew, used_from_percent,
         used_until_percent, consumed_percent, percent_per_hour: consumed_percent.map(|used| used / hours),
         quota_drops, trend })
@@ -557,28 +582,22 @@ mod tests {
         DateTime::parse_from_rfc3339(value).unwrap().with_timezone(&Utc)
     }
 
-    fn comparison_fixture(provider: &str, reset: &str, readings: &[(&str, f64)]) -> (UsageSnapshot, Vec<Observation>) {
-        let points = readings.iter().map(|(time, used)| serde_json::from_value(json!({
+    fn comparison_fixture(reset: &str, readings: &[(&str, f64)]) -> Vec<Observation> {
+        readings.iter().map(|(time, used)| serde_json::from_value(json!({
             "at":time,"windows":[{"id":"weekly","label":"周用量","used":used,"total":100,"resetAt":reset,"windowDurationMins":10080}]
-        })).unwrap()).collect::<Vec<Observation>>();
-        let snapshot = serde_json::from_value(json!({
-            "provider":provider,"planName":provider,"subscriptionExpiresAt":"","windows":points.last().unwrap().windows,
-            "tokenUsage":empty_token_usage(),"creditsRemaining":0,"creditsTotal":0,"resets":[],"updatedAt":readings.last().unwrap().0,
-            "sourcePath":"fixture","accountSource":"usageFile"
-        })).unwrap();
-        (snapshot, points)
+        })).unwrap()).collect()
     }
 
     #[test]
     fn cross_provider_uses_common_interval_despite_different_weekly_resets() {
-        let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+        let gpt_points = comparison_fixture("2026-10-30T00:00:00Z", &[
             ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T01:00:00Z", 12.0), ("2026-10-24T02:00:00Z", 14.0)]);
-        let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
+        let cl_points = comparison_fixture("2026-10-31T00:00:00Z", &[
             ("2026-10-24T00:01:00Z", 20.0), ("2026-10-24T01:59:00Z", 21.0), ("2026-10-24T02:01:00Z", 22.0)]);
         let mut history = History::default();
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
-        let result = compare_providers(&history, &codex, &claude).unwrap();
+        let result = compare_recorded_providers(&history, at("2026-10-24T04:00:00Z")).unwrap();
         assert_eq!(at(&result.start_at), at("2026-10-24T00:01:00Z"));
         assert_eq!(at(&result.end_at), at("2026-10-24T02:01:00Z"));
         assert_eq!(result.codex.consumed_percent, Some(4.0));
@@ -593,32 +612,56 @@ mod tests {
 
     #[test]
     fn cross_provider_pairs_latest_readings_after_a_polling_gap() {
-        let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+        let gpt_points = comparison_fixture("2026-10-30T00:00:00Z", &[
             ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T02:00:00Z", 12.0)]);
-        let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
+        let cl_points = comparison_fixture("2026-10-31T00:00:00Z", &[
             ("2026-10-24T00:01:00Z", 20.0), ("2026-10-24T02:01:00Z", 21.0)]);
         let mut history = History::default();
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
-        let result = compare_providers(&history, &codex, &claude).unwrap();
+        let result = compare_recorded_providers(&history, at("2026-10-24T04:00:00Z")).unwrap();
         assert_eq!(at(&result.end_at), at("2026-10-24T02:01:00Z"));
         assert_eq!(result.claude.endpoint_skew_seconds, 0);
         assert_eq!(result.codex.endpoint_skew_seconds, 60);
     }
 
     #[test]
+    fn cross_provider_opens_existing_history_without_live_snapshots() {
+        let root = std::env::temp_dir().join(format!("codexinfo-comparison-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        let start = (now - Duration::minutes(60)).to_rfc3339();
+        let end = (now - Duration::minutes(30)).to_rfc3339();
+        let reset = (now + Duration::days(1)).to_rfc3339();
+        for (provider, readings) in [("codex", [10.0, 11.0]), ("claude", [20.0, 22.0])] {
+            let points = comparison_fixture(&reset, &[(&start, readings[0]), (&end, readings[1])]);
+            let contents = points.iter().map(|point| serde_json::to_string(point).unwrap()).collect::<Vec<_>>().join("\n");
+            fs::write(root.join(format!("quota-history-{provider}.jsonl")), contents).unwrap();
+        }
+        let result = compare_providers(&root, &mut History::default()).unwrap();
+        assert_eq!(at(&result.start_at), at(&start));
+        assert_eq!(at(&result.end_at), at(&end));
+        assert_eq!(result.claude.consumed_percent, Some(2.0));
+        assert_eq!(result.claude.trend.len(), 2);
+        assert_eq!(result.claude.plan_name, None);
+        fs::remove_file(root.join("quota-history-codex.jsonl")).unwrap();
+        fs::remove_file(root.join("quota-history-claude.jsonl")).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn cross_provider_skips_an_unpaired_prefix_and_handles_alternating_polls() {
-        let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+        let gpt_points = comparison_fixture("2026-10-30T00:00:00Z", &[
             ("2026-10-24T00:00:00Z", 1.0), ("2026-10-24T02:00:00Z", 10.0),
             ("2026-10-24T02:02:00Z", 11.0), ("2026-10-24T02:04:00Z", 12.0)]);
-        let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
+        let cl_points = comparison_fixture("2026-10-31T00:00:00Z", &[
             ("2026-10-24T01:00:00Z", 1.0), ("2026-10-24T02:01:00Z", 10.0),
             ("2026-10-24T02:03:00Z", 11.0), ("2026-10-24T02:05:00Z", 12.0)]);
         let mut history = History::default();
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
         for (provider, time) in [("codex", "2026-10-24T02:06:00Z"), ("claude", "2026-10-24T02:07:00Z")] {
-            let result = compare_providers(&history, &codex, &claude).unwrap();
+            let result = compare_recorded_providers(&history, at("2026-10-24T04:00:00Z")).unwrap();
             assert_eq!(at(&result.start_at), at("2026-10-24T02:01:00Z"));
             assert!(result.codex.endpoint_skew_seconds <= 180);
             assert!(result.claude.endpoint_skew_seconds <= 180);
@@ -627,54 +670,54 @@ mod tests {
             next.at = at(time);
             observations.push(next);
         }
-        let result = compare_providers(&history, &codex, &claude).unwrap();
+        let result = compare_recorded_providers(&history, at("2026-10-24T04:00:00Z")).unwrap();
         assert_eq!(at(&result.end_at), at("2026-10-24T02:07:00Z"));
     }
 
     #[test]
     fn cross_provider_does_not_relax_alignment_for_unpaired_histories() {
-        let (codex, gpt_points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+        let gpt_points = comparison_fixture("2026-10-30T00:00:00Z", &[
             ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T00:01:00Z", 12.0)]);
-        let (claude, cl_points) = comparison_fixture("claude", "2026-10-31T00:00:00Z", &[
+        let cl_points = comparison_fixture("2026-10-31T00:00:00Z", &[
             ("2026-10-24T02:00:00Z", 20.0), ("2026-10-24T02:01:00Z", 21.0)]);
         let mut history = History::default();
         history.observations.insert("codex".into(), gpt_points);
         history.observations.insert("claude".into(), cl_points);
-        assert!(compare_providers(&history, &codex, &claude).err().unwrap().contains("共同采样"));
+        assert!(compare_recorded_providers(&history, at("2026-10-24T04:00:00Z")).err().unwrap().contains("共同采样"));
     }
 
     #[test]
     fn cross_provider_preserves_quota_drops_without_ranking_them() {
-        let (snapshot, points) = comparison_fixture("codex", "2026-10-30T00:00:00Z", &[
+        let points = comparison_fixture("2026-10-30T00:00:00Z", &[
             ("2026-10-24T00:00:00Z", 10.0), ("2026-10-24T00:01:00Z", 5.0), ("2026-10-24T00:02:00Z", 8.0)]);
         let mut history = History::default();
         history.observations.insert("codex".into(), points);
-        let readings = weekly_readings(&history, &snapshot, "codex").unwrap();
-        let result = compare_period(&readings, readings.points[0].at, readings.points[2].at, "Pro").unwrap();
+        let readings = weekly_readings(&history, "codex", at("2026-10-24T04:00:00Z")).unwrap();
+        let result = compare_period(&readings, readings.points[0].at, readings.points[2].at).unwrap();
         assert_eq!(result.quota_drops, 1);
         assert_eq!(result.consumed_percent, None);
         assert_eq!(result.percent_per_hour, None);
         assert_eq!(result.trend[1].used_percent, 5.0);
-        let valid = compare_period(&readings, readings.points[1].at, readings.points[2].at, "Pro").unwrap();
+        let valid = compare_period(&readings, readings.points[1].at, readings.points[2].at).unwrap();
         assert_eq!(valid.consumed_percent, Some(3.0));
     }
 
     #[test]
     fn quota_comparison_requires_no_token_records_and_preserves_real_zero_usage() {
-        let (snapshot, points) = comparison_fixture("claude", "2026-10-30T00:00:00Z", &[
+        let points = comparison_fixture("2026-10-30T00:00:00Z", &[
             ("2026-10-24T02:00:00Z", 10.0), ("2026-10-24T03:00:00Z", 12.0)]);
         let mut history = History::default();
         history.observations.insert("claude".into(), points);
-        let readings = weekly_readings(&history, &snapshot, "claude").unwrap();
-        let result = compare_period(&readings, readings.points[0].at, readings.points[1].at, "Claude Pro").unwrap();
+        let readings = weekly_readings(&history, "claude", at("2026-10-24T04:00:00Z")).unwrap();
+        let result = compare_period(&readings, readings.points[0].at, readings.points[1].at).unwrap();
         assert_eq!(result.consumed_percent, Some(2.0));
         assert_eq!(result.percent_per_hour, Some(2.0));
         assert_eq!(result.used_from_percent, 10.0);
         assert_eq!(result.used_until_percent, 12.0);
-        let (_, points) = comparison_fixture("claude", "2026-10-30T00:00:00Z", &[
+        let points = comparison_fixture("2026-10-30T00:00:00Z", &[
             ("2026-10-24T02:00:00Z", 10.0), ("2026-10-24T03:00:00Z", 10.0)]);
-        let readings = WeeklyReadings { window_id: "weekly".into(), points: points.iter().collect() };
-        let zero = compare_period(&readings, readings.points[0].at, readings.points[1].at, "Claude Pro").unwrap();
+        let readings = WeeklyReadings { window_id: "weekly".into(), points: points.iter().collect(), plan_name: None };
+        let zero = compare_period(&readings, readings.points[0].at, readings.points[1].at).unwrap();
         assert_eq!(zero.consumed_percent, Some(0.0));
         assert_eq!(zero.percent_per_hour, Some(0.0));
     }
